@@ -2,24 +2,32 @@
 File Organizer
 Sorts files into folders (Pictures, Videos, Docs, ...) with a modern UI.
 
-Features: folder picker, custom categories, sort by date, rename by pattern,
-ignore list, duplicate finder, large files finder, auto-organize, activity log
-with restore, undo, custom folder icons (Windows), light/dark theme.
+Features: two-view preview (items / organized folders), double-click and right-click
+on folders, folder icons picked from the project's "icons" folder, auto-manage folders
+in the background with a system tray icon, start with Windows, pop-up notifications
+with an "open folder" link, custom categories, sort by date, rename by pattern, ignore
+list, duplicate finder, large files finder, activity log with restore, undo,
+light/dark theme.
 
-Requires:  pip install customtkinter
-Build exe: python -m PyInstaller --onefile --windowed --collect-all customtkinter --name FileOrganizer file_organizer.py
+Requires:  pip install customtkinter pystray pillow
+Icons:     put your .ico files in an "icons" folder next to this file (they get bundled into the .exe).
+           Users of the .exe can add their own in %APPDATA%\\FileOrganizer\\my-icons (Help > Open icons folder).
+Build exe: python -m PyInstaller --onefile --windowed --collect-all customtkinter --hidden-import pystray._win32 --add-data "icons;icons" --name FileOrganizer file_organizer.py
 """
 
 import os
 import re
+import sys
 import json
+import time
+import queue
 import shutil
+import zlib
 import hashlib
 import fnmatch
 import threading
 import subprocess
 import ctypes
-import time
 from datetime import datetime
 from collections import Counter, defaultdict
 
@@ -28,8 +36,11 @@ OTHERS = "Others"
 DUPES = "Duplicates"
 ICON_FILE = ".foldericon.ico"
 TEMP_EXTS = {".crdownload", ".part", ".tmp", ".download", ".partial"}
-AUTO_INTERVAL_MS = 5000
+WATCH_INTERVAL_MS = 5000
+NOTIFY_SECONDS = 3
 SKIP_NAMES = {"desktop.ini", ICON_FILE}
+BACKGROUND_START = "--background" in sys.argv
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 DEFAULT_CATEGORIES = {
     "Pictures": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".svg", ".ico", ".heic", ".raw"],
@@ -48,11 +59,20 @@ DEFAULT_CONFIG = {
     "last_folder": "",
     "categories": DEFAULT_CATEGORIES,
     "ignore": ["*.tmp", "~*", "Thumbs.db"],
-    "date_mode": "off",      # off | year | month
-    "rename_mode": "off",    # off | date | number
+    "date_mode": "off",          # off | year | month
+    "rename_mode": "off",        # off | date | number
     "include_sub": False,
-    "icons": {},             # category name -> stored .ico path
-    "managed_icons": {},     # managed folder path -> stored .ico path
+    "icons": {},                 # category name -> stored .ico path; only set by "apply to all folders"
+    "folder_icons": {},          # normalised folder path -> {"icon", "name"}, or None = no icon on purpose
+    "known_folders": [],         # category folders the app created or manages (for the icon scope list)
+    "icon_scheme": 2,
+    "excluded": [],              # files/folders that are never organized
+    "exclude_restored": True,    # restored files are added to the exclusion list
+    "watch_folders": [],         # [{"path": str, "enabled": bool}]
+    "bg_enabled": True,          # master switch for background organizing
+    "start_with_windows": False,
+    "close_to_tray": True,
+    "notify": True,
 }
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), APP_NAME)
@@ -72,7 +92,14 @@ def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            data = json.load(f)
+        if data.get("icon_scheme") != 2:
+            # older versions applied one icon to every folder with the same name; start clean
+            data["icons"] = {}
+            data.pop("managed_icons", None)
+            data.pop("icon_names", None)
+            data["icon_scheme"] = 2
+        cfg.update(data)
     except Exception:
         pass
     return cfg
@@ -132,6 +159,15 @@ def human_size(n):
         size /= 1024
 
 
+def short_text(text, limit):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def short_path(path, limit):
+    """Shorten a long path from the left, so the folders that tell places apart stay visible."""
+    return path if len(path) <= limit else "…" + path[-(limit - 1):]
+
+
 def unique_path(path):
     if not os.path.exists(path):
         return path
@@ -155,7 +191,8 @@ def is_ignored(name, patterns):
     return any(fnmatch.fnmatch(low, p.strip().lower()) for p in patterns if p.strip())
 
 
-def collect_files(root, cfg):
+def raw_files(root, cfg):
+    """Every file the app could touch, before the ignore list is applied."""
     skip_dirs = set(cfg["categories"]) | {OTHERS, DUPES}
     found = []
     if cfg["include_sub"]:
@@ -169,9 +206,29 @@ def collect_files(root, cfg):
             p = os.path.join(root, n)
             if os.path.isfile(p):
                 found.append(p)
-    return [p for p in found
-            if os.path.basename(p).lower() not in SKIP_NAMES
-            and not is_ignored(os.path.basename(p), cfg["ignore"])]
+    return [p for p in found if os.path.basename(p).lower() not in SKIP_NAMES]
+
+
+def collect_files(root, cfg):
+    return [p for p in raw_files(root, cfg) if not skip_reason(p, cfg)]
+
+
+def is_busy_file(path):
+    """True if another program still has the file open (renaming it onto itself fails then)."""
+    try:
+        os.rename(path, path)
+        return False
+    except OSError:
+        return True
+
+
+def count_files(path, limit=100000):
+    n = 0
+    for _dp, _dn, fn in os.walk(path):
+        n += sum(1 for f in fn if f.lower() not in SKIP_NAMES)
+        if n >= limit:
+            break
+    return n
 
 
 def date_subdir(path, mode):
@@ -209,6 +266,7 @@ def build_plan(root, cfg, files=None):
 
 
 def execute_plan(root, plan, cfg, progress=None):
+    """Moves files. Returns (moves, errors); each move is (new_path, old_path, category)."""
     moves, errors = [], 0
     total = len(plan)
     for i, item in enumerate(plan, 1):
@@ -217,7 +275,7 @@ def execute_plan(root, plan, cfg, progress=None):
             ensure_category_icon(root, item["category"], cfg)
             dest = unique_path(os.path.join(item["dest_dir"], item["name"]))
             shutil.move(item["src"], dest)
-            moves.append((dest, item["src"]))
+            moves.append((dest, item["src"], item["category"]))
         except OSError:
             errors += 1
         if progress:
@@ -249,6 +307,50 @@ def cleanup_empty_dirs(start_dir, root):
         except OSError:
             break
         d = os.path.dirname(d)
+
+
+def build_notifications(root, moves, max_popups=3):
+    """Turn a batch of moves into pop-up descriptions (one per category folder)."""
+    groups = defaultdict(list)
+    for dest, _src, cat in moves:
+        groups[cat].append(dest)
+    notes = []
+    if not groups:
+        return notes
+    if len(groups) > max_popups:
+        notes.append({"title": "Files organized",
+                      "text": f"{len(moves)} files moved into {len(groups)} folders",
+                      "folder": root, "select": list(groups)})
+        return notes
+    for cat, dests in groups.items():
+        dirs = {os.path.dirname(d) for d in dests}
+        if len(dirs) == 1:
+            folder = next(iter(dirs))
+            select = [os.path.basename(d) for d in dests]
+        else:
+            folder = os.path.join(root, cat)
+            select = []
+        if len(dests) == 1:
+            text = f"{short_text(os.path.basename(dests[0]), 40)} moved to {cat}"
+        else:
+            text = f"{len(dests)} files moved to {cat}"
+        notes.append({"title": "Files organized", "text": text, "folder": folder, "select": select})
+    return notes
+
+
+def unsafe_watch_folder(path):
+    """Returns a reason string if a folder should never be auto-managed, else ''."""
+    p = os.path.normpath(path)
+    if os.path.dirname(p) == p:
+        return "a whole drive"
+    low = os.path.normcase(p)
+    for env in ("WINDIR", "ProgramFiles", "ProgramFiles(x86)"):
+        bad = os.environ.get(env)
+        if bad and low.startswith(os.path.normcase(os.path.normpath(bad))):
+            return "a system folder"
+    if low == os.path.normcase(os.path.expanduser("~")):
+        return "your whole user folder"
+    return ""
 
 
 # ---------- duplicates and large files ----------
@@ -316,7 +418,53 @@ def find_large_files(root, limit=50):
     return items[:limit]
 
 
-# ---------- folder icons (Windows) ----------
+# ---------- icon library (the "icons" folder of the project) ----------
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_icons_dir():
+    """Where users drop their own .ico files: %APPDATA%\\FileOrganizer\\my-icons (C: drive, out of sight)."""
+    return os.path.join(CONFIG_DIR, "my-icons")
+
+
+def icon_library_dirs():
+    """Folders searched for icons: the user's own folder, one next to the app, and the copy bundled in the .exe."""
+    dirs = [user_icons_dir(), os.path.join(app_dir(), "icons")]
+    bundled = os.path.join(getattr(sys, "_MEIPASS", app_dir()), "icons")
+    if bundled not in dirs:
+        dirs.append(bundled)
+    return dirs
+
+
+def list_library_icons():
+    found = {}
+    for d in reversed(icon_library_dirs()):  # earlier folders win: user's own, then next to the app, then bundled
+        try:
+            for n in os.listdir(d):
+                if n.lower().endswith(".ico"):
+                    found[n.lower()] = (n, os.path.join(d, n))
+        except OSError:
+            pass
+    return sorted(found.values(), key=lambda t: t[0].lower())
+
+
+def store_icon(path):
+    """Copy an icon into the app's own storage (named by its content) so folder icons survive if the source moves."""
+    os.makedirs(ICON_DIR, exist_ok=True)
+    with open(path, "rb") as f:
+        data = f.read()
+    dest = os.path.join(ICON_DIR, "ico_" + hashlib.md5(data).hexdigest()[:12] + ".ico")
+    if not os.path.exists(dest):
+        with open(dest, "wb") as f:
+            f.write(data)
+    return dest
+
+
+# ---------- Windows helpers ----------
 
 def _set_attr(path, attr):
     if os.name == "nt":
@@ -386,9 +534,104 @@ def reset_folder_icon(folder):
     _notify_shell()
 
 
+def norm_path(p):
+    return os.path.normcase(os.path.normpath(p))
+
+
+def register_category_folders(cfg, root, names):
+    """Remember the category folders the app creates or manages. Returns True if the list grew."""
+    known = cfg.setdefault("known_folders", [])
+    have = {norm_path(p) for p in known}
+    grew = False
+    for name in names:
+        p = os.path.normpath(os.path.join(root, name))
+        if norm_path(p) not in have:
+            known.append(p)
+            have.add(norm_path(p))
+            grew = True
+    return grew
+
+
+def same_name_folders(known, name, current):
+    """The folder being edited first, then every other known folder with the same name that still exists."""
+    first = os.path.normpath(current)
+    out, have = [first], {norm_path(first)}
+    for p in sorted(known, key=lambda x: x.lower()):
+        q = os.path.normpath(p)
+        if os.path.basename(q).lower() == name.lower() and os.path.isdir(q) and norm_path(q) not in have:
+            out.append(q)
+            have.add(norm_path(q))
+    return out
+
+
+def is_excluded(path, excluded):
+    """True if the path, or any folder above it, is in the exclusion list."""
+    p = norm_path(path)
+    for e in excluded:
+        ne = norm_path(e)
+        if p == ne or p.startswith(ne.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def add_exclusions(cfg, paths):
+    """Add files or folders to the exclusion list. Returns how many were new."""
+    ex = cfg.setdefault("excluded", [])
+    have = {norm_path(p) for p in ex}
+    added = 0
+    for p in paths:
+        key = norm_path(p)
+        if key not in have:
+            ex.append(os.path.normpath(p))
+            have.add(key)
+            added += 1
+    return added
+
+
+def skip_reason(path, cfg):
+    """Why a file is left alone: 'ignore list', 'excluded', or '' if it can be organized."""
+    if is_ignored(os.path.basename(path), cfg["ignore"]):
+        return "ignore list"
+    if is_excluded(path, cfg.get("excluded", [])):
+        return "excluded"
+    return ""
+
+
+def register_existing_categories(cfg, root):
+    """Remember the category folders that already exist inside a root folder."""
+    names = [c for c in list(cfg["categories"]) + [OTHERS, DUPES] if os.path.isdir(os.path.join(root, c))]
+    return register_category_folders(cfg, root, names)
+
+
+def find_named_folders(base, name, max_depth=3, limit=300):
+    """Folders called `name` inside base (up to max_depth levels down). Used to find older app folders."""
+    base = os.path.normpath(base)
+    out = []
+    start = base.rstrip(os.sep).count(os.sep)
+    for dp, dn, _fn in os.walk(base):
+        depth = dp.rstrip(os.sep).count(os.sep) - start
+        for d in dn:
+            if d.lower() == name.lower():
+                out.append(os.path.join(dp, d))
+        dn[:] = [d for d in dn if d.lower() != name.lower() and not d.startswith((".", "$"))]
+        if depth >= max_depth - 1 or len(out) >= limit:
+            dn[:] = []
+        if len(out) >= limit:
+            break
+    return out
+
+
 def ensure_category_icon(root, category, cfg):
-    icon = cfg["icons"].get(category)
+    """Give a category folder its icon after the app creates it.
+    A folder's own choice (even 'no icon') wins; otherwise the 'all folders named X' default is used."""
     folder = os.path.join(root, category)
+    entry = cfg.get("folder_icons", {}).get(norm_path(folder), "unset")
+    if isinstance(entry, dict):
+        icon = entry.get("icon")
+    elif entry is None:
+        icon = None
+    else:
+        icon = cfg["icons"].get(category)
     if icon and os.path.isfile(icon) and os.path.isdir(folder) and not has_our_icon(folder):
         try:
             set_folder_icon(folder, icon)
@@ -396,10 +639,138 @@ def ensure_category_icon(root, category, cfg):
             pass
 
 
+def _shell_select(folder, names):
+    """Open a folder in Explorer with several items selected (Windows shell API)."""
+    try:
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+        shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+        shell32.ILFindLastID.restype = ctypes.c_void_p
+        shell32.ILFindLastID.argtypes = [ctypes.c_void_p]
+        shell32.ILFree.restype = None
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                       ctypes.c_void_p, ctypes.c_ulong]
+        ole32.CoInitialize(None)
+        folder_pidl = shell32.ILCreateFromPathW(os.path.normpath(folder))
+        if not folder_pidl:
+            return False
+        full, children = [], []
+        for n in names:
+            pidl = shell32.ILCreateFromPathW(os.path.normpath(os.path.join(folder, n)))
+            if pidl:
+                full.append(pidl)
+                children.append(shell32.ILFindLastID(pidl))
+        ok = False
+        if children:
+            arr = (ctypes.c_void_p * len(children))(*children)
+            ok = shell32.SHOpenFolderAndSelectItems(folder_pidl, len(children), arr, 0) == 0
+        for p in full:
+            shell32.ILFree(p)
+        shell32.ILFree(folder_pidl)
+        return ok
+    except Exception:
+        return False
+
+
+def open_in_explorer(folder, select=None):
+    """Open a folder in File Explorer, optionally selecting items (names inside that folder)."""
+    if os.name != "nt" or not folder or not os.path.isdir(folder):
+        return
+    select = [n for n in (select or []) if os.path.exists(os.path.join(folder, n))]
+    if select:
+        if _shell_select(folder, select):
+            return
+        subprocess.Popen(["explorer", f"/select,{os.path.normpath(os.path.join(folder, select[0]))}"])
+    else:
+        os.startfile(folder)
+
+
+def open_icons_folder():
+    path = user_icons_dir()
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    if os.name == "nt" and os.path.isdir(path):
+        os.startfile(path)
+
+
+def startup_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --background'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    exe = pyw if os.path.exists(pyw) else sys.executable
+    return f'"{exe}" "{os.path.abspath(__file__)}" --background'
+
+
+def set_startup(enabled):
+    """Add or remove the app from this user's Windows login items. Returns True on success."""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if enabled:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
+
+
+_mutex_handle = None
+
+
+def already_running():
+    """True if another copy of the app is already running (Windows only)."""
+    global _mutex_handle
+    if os.name != "nt":
+        return False
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        _mutex_handle = k32.CreateMutexW(None, False, "Local\\FileOrganizerSingleInstance")
+        return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
+def work_area(root):
+    """(left, top, right, bottom) of the screen without the taskbar."""
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
 # ===== UI =====
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
+from PIL import Image, ImageDraw
+
+try:
+    import pystray
+    HAS_TRAY = True
+except Exception:
+    pystray = None
+    HAS_TRAY = False
 
 CARD_STYLES = [
     {"bg": ("#E6F1FB", "#0C447C"), "fg": ("#0C447C", "#B5D4F4")},
@@ -407,7 +778,32 @@ CARD_STYLES = [
     {"bg": ("#EAF3DE", "#27500A"), "fg": ("#27500A", "#C0DD97")},
     {"bg": ("#F1EFE8", "#444441"), "fg": ("#444441", "#D3D1C7")},
 ]
+FOLDER_COLORS = ["#378ADD", "#BA7517", "#639922", "#7F77DD", "#D85A30", "#1D9E75", "#D4537E", "#888780"]
 INVALID_NAME_CHARS = set('\\/:*?"<>|')
+VIEW_ITEMS = "Items in folder"
+VIEW_FOLDERS = "Organized folders"
+FOLDER_COLS = 4
+ACCENT = "#1f6aa5"
+NEUTRAL_BORDER = ("gray75", "gray35")
+
+
+def darken(hex_color, factor=0.78):
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return "#%02x%02x%02x" % (int(r * factor), int(g * factor), int(b * factor))
+
+
+def make_folder_glyph(color, size=64):
+    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    s = size / 64.0
+    d.rounded_rectangle([4 * s, 12 * s, 28 * s, 26 * s], radius=3 * s, fill=darken(color))
+    d.rounded_rectangle([4 * s, 20 * s, 60 * s, 54 * s], radius=5 * s, fill=color)
+    return im
+
+
+def folder_color(name):
+    return FOLDER_COLORS[zlib.crc32(name.encode("utf-8")) % len(FOLDER_COLORS)]
 
 
 class App(ctk.CTk):
@@ -418,20 +814,35 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("File Organizer")
-        self.geometry("920x660")
-        self.minsize(800, 580)
+        self.geometry("980x720")
+        self.minsize(860, 620)
 
         self.folder = self.cfg.get("last_folder", "")
         self.plan = []
         self.last_moves = []
+        self.recent = Counter()
+        self.item_paths = {}
+        self.item_reason = {}
+        self.tile_widgets = []
+        self.toasts = []
+        self._img_cache = {}
+        self._tray_hint_shown = False
         self.busy = False
+        self.tray = None
+        self.watch_thread = None
+        self.work_lock = threading.Lock()
+        self.ui_queue = queue.Queue()
 
         self.var_sub = tk.BooleanVar(value=self.cfg["include_sub"])
-        self.var_auto = tk.BooleanVar(value=False)
         self.var_date = tk.StringVar(value=self.cfg["date_mode"])
         self.var_rename = tk.StringVar(value=self.cfg["rename_mode"])
         self.var_theme = tk.StringVar(value=self.cfg["theme"])
         self.var_path = tk.StringVar(value=self.folder or "No folder selected")
+        self.var_bg = tk.BooleanVar(value=self.cfg["bg_enabled"])
+        self.var_startup = tk.BooleanVar(value=self.cfg["start_with_windows"])
+        self.var_tray = tk.BooleanVar(value=self.cfg["close_to_tray"])
+        self.var_notify = tk.BooleanVar(value=self.cfg["notify"])
+        self.var_exclude_restored = tk.BooleanVar(value=self.cfg["exclude_restored"])
 
         self._build_menu()
         self._build_ui()
@@ -443,11 +854,27 @@ class App(ctk.CTk):
         self.bind("<F5>", lambda e: self.refresh())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        found_new = False
+        for w in self.cfg["watch_folders"]:
+            if os.path.isdir(w.get("path", "")):
+                found_new |= register_existing_categories(self.cfg, w["path"])
+        if found_new:
+            save_config(self.cfg)
         if self._folder_ok():
             self.refresh()
         else:
             self.status.configure(text="Select a folder to begin (File > Select folder).")
-        self.after(AUTO_INTERVAL_MS, self._auto_tick)
+            self.refresh_folders()
+        self._update_bg_label()
+
+        self._start_tray()
+        if self.cfg["start_with_windows"]:
+            set_startup(True)  # keeps the login entry pointing at this copy of the app
+        if BACKGROUND_START and self.tray:
+            self.withdraw()
+
+        self.after(200, self._poll_queue)
+        self.after(WATCH_INTERVAL_MS, self._watch_tick)
 
     # ------------------------------------------------------------ menus / layout
     def _build_menu(self):
@@ -455,17 +882,15 @@ class App(ctk.CTk):
 
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Select folder...", accelerator="Ctrl+O", command=self.select_folder)
-        m.add_command(label="Open folder in Explorer", command=self.open_folder)
+        m.add_command(label="Open folder in Explorer", command=lambda: self.open_path(self.folder))
         m.add_separator()
-        m.add_command(label="Exit", command=self._on_close)
+        m.add_command(label="Exit", command=self._quit)
         bar.add_cascade(label="File", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Organize now", accelerator="Ctrl+R", command=self.organize)
         m.add_command(label="Undo last organize", accelerator="Ctrl+Z", command=self.undo)
-        m.add_command(label="Refresh list", accelerator="F5", command=self.refresh)
-        m.add_separator()
-        m.add_checkbutton(label="Auto-organize new files", variable=self.var_auto, command=self._on_auto_toggle)
+        m.add_command(label="Refresh", accelerator="F5", command=self.refresh)
         bar.add_cascade(label="Actions", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
@@ -473,6 +898,18 @@ class App(ctk.CTk):
         m.add_command(label="Find large files...", command=self.open_large_files)
         m.add_command(label="Activity log...", command=self.open_log)
         bar.add_cascade(label="Tools", menu=m)
+
+        m = tk.Menu(bar, tearoff=0)
+        m.add_command(label="Auto-manage folders...", command=self.open_watch)
+        m.add_checkbutton(label="Auto-organize in background", variable=self.var_bg, command=self._on_bg_toggle)
+        m.add_separator()
+        m.add_checkbutton(label="Start with Windows", variable=self.var_startup, command=self._on_startup_toggle)
+        m.add_checkbutton(label="Keep running in the tray when the window is closed",
+                          variable=self.var_tray, command=self._on_tray_toggle)
+        m.add_checkbutton(label="Show pop-up notifications", variable=self.var_notify, command=self._on_notify_toggle)
+        m.add_separator()
+        m.add_command(label="Send a test notification", command=self.test_notification)
+        bar.add_cascade(label="Background", menu=m)
 
         m = tk.Menu(bar, tearoff=0)
         m.add_checkbutton(label="Include subfolders", variable=self.var_sub, command=self._on_sub_toggle)
@@ -488,6 +925,7 @@ class App(ctk.CTk):
         m.add_separator()
         m.add_command(label="Custom categories...", command=self.open_categories)
         m.add_command(label="Ignore list...", command=self.open_ignore)
+        m.add_command(label="Exclusions...", command=self.open_exclusions)
         m.add_command(label="Folder icons...", command=self.open_icons)
         m.add_separator()
         theme_menu = tk.Menu(m, tearoff=0)
@@ -498,6 +936,7 @@ class App(ctk.CTk):
 
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="How it works", command=self.show_help)
+        m.add_command(label="Open icons folder", command=open_icons_folder)
         m.add_command(label="About", command=lambda: messagebox.showinfo(
             "About", "File Organizer\nSorts files into folders by type.\nBuilt with Python and customtkinter."))
         bar.add_cascade(label="Help", menu=m)
@@ -519,23 +958,43 @@ class App(ctk.CTk):
             card = ctk.CTkFrame(cards, fg_color=style["bg"], corner_radius=10)
             card.grid(row=0, column=i, padx=(0 if i == 0 else 6, 0 if i == 3 else 6), sticky="ew")
             name = ctk.CTkLabel(card, text="-", text_color=style["fg"], font=ctk.CTkFont(size=12), anchor="w")
-            name.pack(fill="x", padx=12, pady=(10, 0))
-            count = ctk.CTkLabel(card, text="0", text_color=style["fg"], font=ctk.CTkFont(size=24, weight="bold"), anchor="w")
-            count.pack(fill="x", padx=12, pady=(0, 10))
+            name.pack(fill="x", padx=12, pady=(8, 0))
+            count = ctk.CTkLabel(card, text="0", text_color=style["fg"], font=ctk.CTkFont(size=22, weight="bold"), anchor="w")
+            count.pack(fill="x", padx=12, pady=(0, 8))
             self.card_name.append(name)
             self.card_count.append(count)
 
-        mid = ctk.CTkFrame(self, fg_color="transparent")
-        mid.pack(fill="both", expand=True, padx=16, pady=8)
-        self.tree = ttk.Treeview(mid, columns=("file", "dest"), show="headings", selectmode="browse")
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=16, pady=(8, 0))
+        self.view_btn = ctk.CTkSegmentedButton(bar, values=[VIEW_ITEMS, VIEW_FOLDERS], command=self._switch_view)
+        self.view_btn.pack(side="left")
+        self.view_btn.set(VIEW_ITEMS)
+        self.view_hint = ctk.CTkLabel(bar, text="", text_color=("gray35", "gray70"), anchor="w")
+        self.view_hint.pack(side="left", padx=12)
+
+        self.mid = ctk.CTkFrame(self, fg_color="transparent")
+        self.mid.pack(fill="both", expand=True, padx=16, pady=8)
+
+        self.items_frame = ctk.CTkFrame(self.mid, fg_color="transparent")
+        self.tree = ttk.Treeview(self.items_frame, columns=("file", "dest"), show="headings", selectmode="browse")
         self.tree.heading("file", text="File", anchor="w")
         self.tree.heading("dest", text="Goes to", anchor="w")
-        self.tree.column("file", width=520)
+        self.tree.column("file", width=560)
         self.tree.column("dest", width=240)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.tag_configure("skipped", foreground="#888888")
+        self.tree.bind("<Double-1>", self._on_item_double)
+        self.tree.bind("<Button-3>", self._on_item_menu)
+        sb = ttk.Scrollbar(self.items_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
+
+        self.folders_frame = ctk.CTkScrollableFrame(self.mid, fg_color="transparent")
+        for c in range(FOLDER_COLS):
+            self.folders_frame.grid_columnconfigure(c, weight=1, uniform="tile")
+
+        self.items_frame.pack(fill="both", expand=True)
+        self._update_view_hint(VIEW_ITEMS)
 
         bottom = ctk.CTkFrame(self, fg_color="transparent")
         bottom.pack(fill="x", padx=16, pady=(0, 16))
@@ -546,10 +1005,10 @@ class App(ctk.CTk):
         row.pack(fill="x")
         self.status = ctk.CTkLabel(row, text="", anchor="w", text_color=("gray35", "gray70"))
         self.status.pack(side="left", fill="x", expand=True)
+        self.bg_label = ctk.CTkLabel(row, text="", text_color=("gray35", "gray70"))
+        self.bg_label.pack(side="left", padx=8)
         ctk.CTkCheckBox(row, text="Include subfolders", variable=self.var_sub,
                         command=self._on_sub_toggle).pack(side="left", padx=8)
-        ctk.CTkSwitch(row, text="Auto-organize", variable=self.var_auto,
-                      command=self._on_auto_toggle).pack(side="left", padx=8)
         ctk.CTkButton(row, text="Undo", width=80, height=36, fg_color="transparent", border_width=1,
                       text_color=("gray10", "gray90"), command=self.undo).pack(side="left", padx=4)
         ctk.CTkButton(row, text="Organize now", width=130, height=36, command=self.organize).pack(side="left", padx=(4, 0))
@@ -563,10 +1022,84 @@ class App(ctk.CTk):
         st.theme_use("clam")
         st.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=28,
                      borderwidth=0, font=("Segoe UI", 10))
-        st.map("Treeview", background=[("selected", "#1f6aa5")], foreground=[("selected", "#ffffff")])
+        st.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
         st.configure("Treeview.Heading", background=head, foreground=fg, relief="flat",
                      font=("Segoe UI", 10, "bold"))
         st.map("Treeview.Heading", background=[("active", head)])
+
+    # ------------------------------------------------------------ views
+    def _update_view_hint(self, value):
+        if value == VIEW_ITEMS:
+            self.view_hint.configure(text="Everything in the folder and where it will go. Double-click a file to show it in Explorer.")
+        else:
+            self.view_hint.configure(text="Double-click a folder to open it. Right-click for more options.")
+
+    def _switch_view(self, value):
+        if value == VIEW_ITEMS:
+            self.folders_frame.pack_forget()
+            self.items_frame.pack(fill="both", expand=True)
+        else:
+            self.items_frame.pack_forget()
+            self.folders_frame.pack(fill="both", expand=True)
+        self._update_view_hint(value)
+
+    def show_view(self, value):
+        self.view_btn.set(value)
+        self._switch_view(value)
+
+    def _on_item_double(self, _event):
+        sel = self.tree.selection()
+        if sel and sel[0] in self.item_paths:
+            p = self.item_paths[sel[0]]
+            open_in_explorer(os.path.dirname(p), [os.path.basename(p)])
+
+    def _on_item_menu(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid or iid not in self.item_paths:
+            return
+        self.tree.selection_set(iid)
+        path = self.item_paths[iid]
+        why = self.item_reason.get(iid, "")
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Show in File Explorer",
+                      command=lambda: open_in_explorer(os.path.dirname(path), [os.path.basename(path)]))
+        m.add_separator()
+        if why == "excluded":
+            m.add_command(label="Include in organizing again", command=lambda: self.include_again(path))
+        elif not why:
+            m.add_command(label="Exclude this file from organizing", command=lambda: self.exclude_paths([path]))
+            folder = os.path.dirname(path)
+            if os.path.normcase(os.path.normpath(folder)) != os.path.normcase(os.path.normpath(self.folder)):
+                m.add_command(label=f"Exclude the folder '{os.path.basename(folder)}' (everything inside)",
+                              command=lambda: self.exclude_paths([folder]))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def exclude_paths(self, paths):
+        added = add_exclusions(self.cfg, paths)
+        save_config(self.cfg)
+        self.refresh(status=False)
+        self.status.configure(text=f"{added} item(s) excluded from organizing. Manage them under Options > Exclusions.")
+
+    def include_again(self, path):
+        key = norm_path(path)
+        before = len(self.cfg["excluded"])
+        self.cfg["excluded"] = [e for e in self.cfg["excluded"] if norm_path(e) != key]
+        if len(self.cfg["excluded"]) == before:
+            owner = next((e for e in self.cfg["excluded"] if is_excluded(path, [e])), "")
+            messagebox.showinfo("Exclusions", f"This file is excluded because its folder is excluded:\n{owner}\n\n"
+                                              "Remove that folder under Options > Exclusions.")
+            return
+        save_config(self.cfg)
+        self.refresh()
+
+    def open_path(self, path):
+        if path and os.path.isdir(path):
+            open_in_explorer(path)
+        else:
+            messagebox.showwarning("File Organizer", "That folder isn't there any more.")
 
     # ------------------------------------------------------------ basic actions
     def _folder_ok(self, warn=False):
@@ -583,33 +1116,48 @@ class App(ctk.CTk):
             self.cfg["last_folder"] = self.folder
             save_config(self.cfg)
             self.last_moves = []
+            self.recent = Counter()
             self.refresh()
-
-    def open_folder(self):
-        if self._folder_ok(warn=True) and os.name == "nt":
-            os.startfile(self.folder)
+            self.show_view(VIEW_ITEMS)
 
     def refresh(self, status=True):
         self.tree.delete(*self.tree.get_children())
+        self.item_paths = {}
+        self.item_reason = {}
         if not self._folder_ok():
             self.plan = []
             self._update_cards()
+            self.refresh_folders()
             return
+        skipped = []
         try:
             self.plan = build_plan(self.folder, self.cfg)
+            for p in raw_files(self.folder, self.cfg):
+                why = skip_reason(p, self.cfg)
+                if why:
+                    skipped.append((p, why))
         except OSError as e:
             self.plan = []
             self.status.configure(text=f"Couldn't read the folder: {e}")
-        shown = self.plan[:3000]
-        for item in shown:
-            rel_src = os.path.relpath(item["src"], self.folder)
-            self.tree.insert("", "end", values=(rel_src, item["rel"]))
+        limit = 3000
+        shown = 0
+        for item in self.plan[:limit]:
+            iid = self.tree.insert("", "end", values=(os.path.relpath(item["src"], self.folder), item["rel"]))
+            self.item_paths[iid] = item["src"]
+            shown += 1
+        for p, why in skipped[:max(0, limit - shown)]:
+            iid = self.tree.insert("", "end", values=(os.path.relpath(p, self.folder), f"Skipped ({why})"),
+                                   tags=("skipped",))
+            self.item_paths[iid] = p
+            self.item_reason[iid] = why
         self._update_cards()
+        self.refresh_folders()
         self.progress.set(0)
         if status:
             n = len(self.plan)
-            extra = f" (showing first {len(shown)})" if n > len(shown) else ""
-            self.status.configure(text=f"{n} file(s) ready to organize{extra}.")
+            extra = f", {len(skipped)} skipped" if skipped else ""
+            more = f" (showing first {limit})" if n + len(skipped) > limit else ""
+            self.status.configure(text=f"{n} file(s) ready to organize{extra}{more}.")
 
     def _update_cards(self):
         counts = Counter(p["category"] for p in self.plan)
@@ -630,6 +1178,342 @@ class App(ctk.CTk):
         self.card_name[3].configure(text="Everything else")
         self.card_count[3].configure(text=str(rest))
 
+    # ------------------------------------------------------------ organized folders (tiles)
+    def load_icon_image(self, path, size):
+        try:
+            key = (path, size, os.path.getmtime(path))
+        except OSError:
+            key = (path, size, 0)
+        if key in self._img_cache:
+            return self._img_cache[key]
+        try:
+            im = Image.open(path).convert("RGBA").resize((size, size))
+        except Exception:
+            im = make_folder_glyph("#888780")
+        img = ctk.CTkImage(light_image=im, dark_image=im, size=(size, size))
+        self._img_cache[key] = img
+        return img
+
+    def folder_image(self, name, path, size=52):
+        """The tile picture: the icon the folder really has, else a drawn folder."""
+        icon_file = os.path.join(path, ICON_FILE)
+        if has_our_icon(path) and os.path.isfile(icon_file):
+            return self.load_icon_image(icon_file, size)
+        key = ("glyph", name, size)
+        if key not in self._img_cache:
+            im = make_folder_glyph(folder_color(name))
+            self._img_cache[key] = ctk.CTkImage(light_image=im, dark_image=im, size=(size, size))
+        return self._img_cache[key]
+
+    def refresh_folders(self):
+        for w in self.tile_widgets:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self.tile_widgets = []
+        if not self._folder_ok():
+            names = []
+        else:
+            candidates = list(self.cfg["categories"]) + [OTHERS, DUPES]
+            names = [c for c in candidates if os.path.isdir(os.path.join(self.folder, c))]
+            if register_category_folders(self.cfg, self.folder, names):
+                save_config(self.cfg)
+        if not names:
+            hint = ctk.CTkLabel(self.folders_frame, text_color=("gray35", "gray70"),
+                                text="No organized folders yet.\nPress Organize now and they will show up here.")
+            hint.grid(row=0, column=0, columnspan=FOLDER_COLS, pady=40)
+            self.tile_widgets.append(hint)
+            return
+        for i, name in enumerate(names):
+            self._make_tile(i // FOLDER_COLS, i % FOLDER_COLS, name)
+
+    def _make_tile(self, r, c, name):
+        path = os.path.join(self.folder, name)
+        count = count_files(path)
+        new = self.recent.get(name, 0)
+        tile = ctk.CTkFrame(self.folders_frame, corner_radius=10, border_width=2 if new else 1,
+                            border_color=ACCENT if new else NEUTRAL_BORDER)
+        tile.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+        pic = ctk.CTkLabel(tile, text="", image=self.folder_image(name, path))
+        pic.pack(pady=(14, 4))
+        title = ctk.CTkLabel(tile, text=short_text(name, 18), font=ctk.CTkFont(size=13, weight="bold"))
+        title.pack()
+        info = f"{count} item(s)" + (f"   +{new} new" if new else "")
+        sub = ctk.CTkLabel(tile, text=info, font=ctk.CTkFont(size=11),
+                           text_color=(ACCENT, "#6cb0ff") if new else ("gray35", "gray70"))
+        sub.pack(pady=(0, 12))
+        for w in (tile, pic, title, sub):
+            w.bind("<Double-Button-1>", lambda e, p=path: self.open_path(p))
+            w.bind("<Button-3>", lambda e, n=name: self._tile_menu(e, n))
+        self.tile_widgets.append(tile)
+
+    def _tile_menu(self, event, name):
+        path = os.path.join(self.folder, name)
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Open in File Explorer", command=lambda: self.open_path(path))
+        m.add_separator()
+        m.add_command(label="Edit folder icon...", command=lambda: self.edit_folder_icon(name))
+        m.add_command(label="Reset icon...", command=lambda: self.reset_folder_icon_for(name))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def edit_folder_icon(self, name):
+        path = os.path.join(self.folder, name)
+
+        def picked(lib_path, lib_name):
+            self.open_icon_scope(name, path, lib_path, lib_name)
+
+        self.pick_library_icon(picked, f"Icon for {name}")
+
+    def reset_folder_icon_for(self, name):
+        self.open_icon_scope(name, os.path.join(self.folder, name), None, None)
+
+    # ------------------------------------------------------------ icon bookkeeping
+    def current_icon_for(self, path):
+        """The icon a folder shows right now, as {'path', 'name'}, or None."""
+        entry = self.cfg["folder_icons"].get(norm_path(path), "unset")
+        if isinstance(entry, dict):
+            return {"path": entry["icon"], "name": entry["name"]}
+        if entry is None:
+            return None
+        icon_file = os.path.join(path, ICON_FILE)
+        if has_our_icon(path) and os.path.isfile(icon_file):
+            return {"path": icon_file, "name": "Custom icon"}
+        return None
+
+    def apply_icon_to(self, paths, lib_path, lib_name, default_for=None):
+        """Give each folder in paths the icon. default_for=<name> also makes it the default for new folders
+        with that name ('all' scope). Returns a list of error messages."""
+        try:
+            stored = store_icon(lib_path)
+        except OSError as e:
+            return [f"Couldn't read the icon: {e}"]
+        errors = []
+        if default_for:
+            self.cfg["icons"][default_for] = stored
+        for p in paths:
+            self.cfg["folder_icons"][norm_path(p)] = {"icon": stored, "name": lib_name}
+            try:
+                if os.path.isdir(p):
+                    set_folder_icon(p, stored)
+            except OSError as e:
+                errors.append(f"{p}: {e}")
+        save_config(self.cfg)
+        return errors
+
+    def reset_icons(self, paths, drop_default_for=None):
+        """Remove the icon from each folder in paths. drop_default_for=<name> also removes the 'all' default."""
+        errors = []
+        if drop_default_for:
+            self.cfg["icons"].pop(drop_default_for, None)
+        for p in paths:
+            try:
+                reset_folder_icon(p)
+            except OSError as e:
+                errors.append(f"{p}: {e}")
+            key = norm_path(p)
+            if self.cfg["icons"].get(os.path.basename(os.path.normpath(p))):
+                self.cfg["folder_icons"][key] = None   # keep it bare even though a default exists
+            else:
+                self.cfg["folder_icons"].pop(key, None)
+        save_config(self.cfg)
+        return errors
+
+    def open_icon_scope(self, name, current_path, lib_path, lib_name):
+        """Ask which folders an icon change applies to: this one, several ticked ones, or every folder with this name."""
+        resetting = lib_path is None
+        folders = same_name_folders(self.cfg["known_folders"], name, current_path)
+        win = self._toplevel(("Reset icon: " if resetting else "Apply icon: ") + name, 700, 720)
+
+        head = ctk.CTkFrame(win, fg_color="transparent")
+        head.pack(fill="x", padx=16, pady=(14, 6))
+        if resetting:
+            ctk.CTkLabel(head, text=f"Remove the custom icon from '{name}' folders",
+                         font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        else:
+            img = self.load_icon_image(lib_path, 40)
+            win._keep_img = img
+            ctk.CTkLabel(head, text="", image=img).pack(side="left")
+            ctk.CTkLabel(head, text=f"Use {lib_name} for:", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=10)
+
+        var = tk.StringVar(value="single")
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16)
+        muted = ("gray35", "gray70")
+        list_holder = ctk.CTkFrame(body, fg_color="transparent")
+        sel_all_var = tk.BooleanVar(value=False)
+        state = {"rows": [], "checks": []}
+        ticked = {norm_path(folders[0])}   # the folder you right-clicked starts ticked
+
+        def sync():
+            sel_all_var.set(bool(state["checks"]) and all(v.get() for _, v in state["checks"]))
+
+        def toggle_all():
+            val = sel_all_var.get()
+            for _, v in state["checks"]:
+                v.set(val)
+
+        sel_all = ctk.CTkCheckBox(list_holder, text="", variable=sel_all_var, command=toggle_all)
+        listbox = ctk.CTkScrollableFrame(list_holder, height=230)
+        find_row = ctk.CTkFrame(list_holder, fg_color="transparent")
+        find_note = ctk.CTkLabel(find_row, text="", text_color=muted, anchor="w")
+        extra = "" if resetting else " and the ones the app creates later"
+        all_radio = ctk.CTkRadioButton(body, text="", variable=var, value="all", command=lambda: update_list())
+
+        def rebuild():
+            for r in state["rows"]:
+                r.destroy()
+            state["rows"], state["checks"] = [], []
+            for i, p in enumerate(folders):
+                v = tk.BooleanVar(value=norm_path(p) in ticked)
+                row = ctk.CTkFrame(listbox, fg_color="transparent")
+                row.pack(fill="x", pady=(2, 6))
+                parent_name = os.path.basename(os.path.dirname(p)) or p
+                label = f"{parent_name}  ›  {name}" + ("    (the one you right-clicked)" if i == 0 else "")
+                ctk.CTkCheckBox(row, text=label, variable=v, command=sync).pack(anchor="w")
+                ctk.CTkLabel(row, text=p, text_color=muted, font=ctk.CTkFont(size=11), anchor="w",
+                             justify="left", wraplength=560).pack(anchor="w", padx=(28, 0))
+                state["rows"].append(row)
+                state["checks"].append((p, v))
+            sel_all.configure(text=f"Select all ({len(folders)})")
+            all_radio.configure(text=f"All folders named '{name}' ({len(folders)} found){extra}")
+            sync()
+
+        def find_more():
+            path = filedialog.askdirectory(parent=win, title=f"Look for '{name}' folders in...")
+            if not path:
+                return
+            found = find_named_folders(path, name)
+            added = sum(1 for p in found if register_category_folders(
+                self.cfg, os.path.dirname(p), {os.path.basename(p)}))
+            save_config(self.cfg)
+            ticked.clear()
+            ticked.update(norm_path(p) for p, v in state["checks"] if v.get())
+            folders[:] = same_name_folders(self.cfg["known_folders"], name, current_path)
+            rebuild()
+            find_note.configure(text=f"Found {len(found)} in that location, {added} new.")
+
+        ctk.CTkButton(find_row, text="Find more folders...", width=160, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=find_more).pack(side="left")
+        find_note.pack(side="left", padx=10)
+
+        parts = [(sel_all, dict(anchor="w", padx=(26, 0), pady=(4, 2))),
+                 (listbox, dict(fill="x", padx=(26, 0), pady=(2, 4))),
+                 (find_row, dict(anchor="w", padx=(26, 0), pady=(0, 6)))]
+
+        def update_list():
+            for w, _ in parts:
+                w.pack_forget()
+            if var.get() == "multiple":
+                for w, opts in parts:
+                    w.pack(**opts)
+
+        ctk.CTkRadioButton(body, text="This folder only", variable=var, value="single",
+                           command=update_list).pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(body, text=folders[0], text_color=muted, font=ctk.CTkFont(size=11), anchor="w",
+                     justify="left", wraplength=600).pack(anchor="w", padx=26)
+        ctk.CTkRadioButton(body, text=f"Several folders named '{name}'... (choose from a list)", variable=var,
+                           value="multiple", command=update_list).pack(anchor="w", pady=(12, 0))
+        list_holder.pack(fill="x")
+        all_radio.pack(anchor="w", pady=(12, 0))
+        ctk.CTkLabel(body, text="The list shows folders the app has organized into. Use 'Find more folders...' to "
+                                "search another location for older ones.", text_color=muted, justify="left",
+                     wraplength=620).pack(anchor="w", pady=(14, 0))
+        rebuild()
+
+        def do_apply():
+            mode = var.get()
+            if mode == "single":
+                targets = [folders[0]]
+            elif mode == "multiple":
+                targets = [p for p, v in state["checks"] if v.get()]
+                if not targets:
+                    messagebox.showinfo("Folder icon", "Tick at least one folder.", parent=win)
+                    return
+            else:
+                targets = list(folders)
+            default_for = name if mode == "all" else None
+            if resetting:
+                errors = self.reset_icons(targets, drop_default_for=default_for)
+            else:
+                errors = self.apply_icon_to(targets, lib_path, lib_name, default_for=default_for)
+            win.destroy()
+            self.refresh_folders()
+            if errors:
+                messagebox.showwarning("Folder icon", "Some folders couldn't be changed:\n" + "\n".join(errors[:6]))
+            else:
+                self.status.configure(
+                    text=f"Icon {'reset' if resetting else 'applied'} on {len(targets)} folder(s). "
+                         "If Explorer still shows the old icon, press F5 there.")
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(8, 14))
+        ctk.CTkButton(row, text="Reset icon" if resetting else "Apply", width=110, command=do_apply).pack(side="right")
+        ctk.CTkButton(row, text="Cancel", width=80, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=win.destroy).pack(side="right", padx=8)
+
+    def pick_library_icon(self, on_pick, title="Choose an icon"):
+        """Pick one of the .ico files in the project's icons folder. on_pick(path, name)."""
+        icons = list_library_icons()
+        win = self._toplevel(title, 600, 480)
+        if not icons:
+            ctk.CTkLabel(win, justify="left", wraplength=540,
+                         text="No icons found yet.\n\nPut your .ico files in this folder, then open this window again:\n\n"
+                              + icon_library_dirs()[0]).pack(anchor="w", padx=20, pady=20)
+            ctk.CTkButton(win, text="Open icons folder", command=open_icons_folder).pack(pady=6)
+            return
+        ctk.CTkLabel(win, text="Pick an icon from your icons folder. Double-click to use it right away.",
+                     text_color=("gray35", "gray70")).pack(anchor="w", padx=16, pady=(14, 4))
+        scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=10, pady=4)
+        cols = 5
+        for c in range(cols):
+            scroll.grid_columnconfigure(c, weight=1, uniform="ic")
+        state = {"cell": None, "path": None, "name": None}
+        keep = []
+
+        def choose(cell, path, name):
+            if state["cell"] is not None:
+                try:
+                    state["cell"].configure(border_width=1, border_color=NEUTRAL_BORDER)
+                except Exception:
+                    pass
+            cell.configure(border_width=2, border_color=ACCENT)
+            state.update(cell=cell, path=path, name=name)
+
+        def use(path=None, name=None):
+            p, n = path or state["path"], name or state["name"]
+            if not p:
+                messagebox.showinfo("Choose an icon", "Select an icon first.", parent=win)
+                return
+            win.destroy()
+            on_pick(p, n)
+
+        for i, (name, path) in enumerate(icons):
+            cell = ctk.CTkFrame(scroll, corner_radius=8, border_width=1, border_color=NEUTRAL_BORDER)
+            cell.grid(row=i // cols, column=i % cols, padx=4, pady=4, sticky="nsew")
+            img = self.load_icon_image(path, 40)
+            keep.append(img)
+            pic = ctk.CTkLabel(cell, text="", image=img)
+            pic.pack(pady=(8, 2))
+            cap = ctk.CTkLabel(cell, text=short_text(name, 14), font=ctk.CTkFont(size=11))
+            cap.pack(pady=(0, 8))
+            for w in (cell, pic, cap):
+                w.bind("<Button-1>", lambda e, c=cell, p=path, n=name: choose(c, p, n))
+                w.bind("<Double-Button-1>", lambda e, p=path, n=name: use(p, n))
+        win._keep_images = keep
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(6, 14))
+        ctk.CTkButton(row, text="Open icons folder", width=140, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=open_icons_folder).pack(side="left")
+        ctk.CTkButton(row, text="Use this icon", width=120, command=use).pack(side="right")
+        ctk.CTkButton(row, text="Cancel", width=80, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=win.destroy).pack(side="right", padx=8)
+
     # ------------------------------------------------------------ option handlers
     def _on_sub_toggle(self):
         self.cfg["include_sub"] = self.var_sub.get()
@@ -648,21 +1532,48 @@ class App(ctk.CTk):
         ctk.set_appearance_mode(self.cfg["theme"])
         self.after(80, self.apply_tree_style)
 
-    def _on_auto_toggle(self):
-        if self.var_auto.get():
-            if not self._folder_ok(warn=True):
-                self.var_auto.set(False)
-                return
-            self.status.configure(text="Auto-organize is on: new files are sorted every few seconds.")
-        else:
-            self.status.configure(text="Auto-organize is off.")
-
-    def _on_close(self):
-        self.cfg["last_folder"] = self.folder
+    def _on_bg_toggle(self):
+        self.cfg["bg_enabled"] = self.var_bg.get()
         save_config(self.cfg)
-        self.destroy()
+        self._update_bg_label()
+        if self.tray:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                pass
 
-    # ------------------------------------------------------------ organize / undo
+    def _on_startup_toggle(self):
+        want = self.var_startup.get()
+        if not set_startup(want):
+            self.var_startup.set(not want)
+            messagebox.showwarning("Start with Windows", "Couldn't change the startup setting. This only works on Windows.")
+            return
+        self.cfg["start_with_windows"] = want
+        save_config(self.cfg)
+        if want and not self.tray:
+            messagebox.showinfo("Start with Windows",
+                                "The tray icon needs the 'pystray' library (pip install pystray). "
+                                "Without it, the app will open its window at login instead of hiding.")
+
+    def _on_tray_toggle(self):
+        self.cfg["close_to_tray"] = self.var_tray.get()
+        save_config(self.cfg)
+
+    def _on_notify_toggle(self):
+        self.cfg["notify"] = self.var_notify.get()
+        save_config(self.cfg)
+
+    def _update_bg_label(self):
+        n = sum(1 for w in self.cfg["watch_folders"] if w.get("enabled", True))
+        if not self.cfg["bg_enabled"]:
+            text = "Background: off"
+        elif n == 0:
+            text = "Background: no folders yet"
+        else:
+            text = f"Background: watching {n} folder{'s' if n != 1 else ''}"
+        self.bg_label.configure(text=text)
+
+    # ------------------------------------------------------------ organize / undo (manual)
     def organize(self):
         if not self._folder_ok(warn=True) or self.busy:
             return
@@ -672,9 +1583,12 @@ class App(ctk.CTk):
             return
         if not messagebox.askyesno("File Organizer", f"Move {len(self.plan)} file(s) into category folders?"):
             return
-        self._run_plan(self.plan, source="manual")
+        self._run_plan(self.plan)
 
-    def _run_plan(self, plan, source):
+    def _run_plan(self, plan):
+        if not self.work_lock.acquire(blocking=False):
+            messagebox.showinfo("File Organizer", "The background organizer is busy. Try again in a few seconds.")
+            return
         self.busy = True
         self.progress.set(0)
 
@@ -684,55 +1598,286 @@ class App(ctk.CTk):
             if i % 5 == 0 or i == total:
                 self.update_idletasks()
 
-        moves, errors = execute_plan(self.folder, plan, self.cfg, cb)
-        self.busy = False
+        try:
+            moves, errors = execute_plan(self.folder, plan, self.cfg, cb)
+        finally:
+            self.busy = False
+            self.work_lock.release()
         if moves:
             self.last_moves = moves
-            append_log([log_entry("move", old, new) for new, old in moves])
+            self.recent = Counter(cat for _d, _s, cat in moves)
+            append_log([log_entry("move", old, new) for new, old, _c in moves])
         self.refresh(status=False)
         self.progress.set(1 if moves else 0)
-        if source == "auto":
-            self.status.configure(text=f"Auto-organized {len(moves)} new file(s).")
-        else:
-            self.status.configure(text=f"Done. Moved {len(moves)} file(s), {errors} error(s). Undo is available.")
-            messagebox.showinfo("File Organizer", f"Moved {len(moves)} file(s).\nErrors: {errors}")
+        self.status.configure(text=f"Done. Moved {len(moves)} file(s), {errors} error(s). Undo is available.")
+        self.show_view(VIEW_FOLDERS)
+        for note in build_notifications(self.folder, moves):
+            self.show_toast(note)
 
     def undo(self):
         if not self.last_moves:
             messagebox.showinfo("File Organizer", "Nothing to undo.")
             return
-        restored, entries = 0, []
-        for new, old in reversed(self.last_moves):
+        restored, entries, back = 0, [], []
+        for new, old, _cat in reversed(self.last_moves):
             try:
                 target = restore_file(new, old)
                 if target:
                     restored += 1
+                    back.append(target)
                     entries.append(log_entry("restore", new, target))
                     if self._folder_ok():
                         cleanup_empty_dirs(os.path.dirname(new), self.folder)
             except OSError:
                 pass
         self.last_moves = []
+        self.recent = Counter()
         append_log(entries)
+        excluded = False
+        if back and self.cfg.get("exclude_restored", True):
+            excluded = add_exclusions(self.cfg, back) > 0
+            save_config(self.cfg)
         self.refresh(status=False)
-        self.status.configure(text=f"Undo complete. Restored {restored} file(s).")
+        note = " They are excluded from organizing now (Options > Exclusions)." if excluded else ""
+        self.status.configure(text=f"Undo complete. Restored {restored} file(s).{note}")
 
-    def _auto_tick(self):
+    # ------------------------------------------------------------ background watcher
+    def _watch_tick(self):
         try:
-            if self.var_auto.get() and self._folder_ok() and not self.busy:
-                now = time.time()
-                ready = []
-                for f in collect_files(self.folder, self.cfg):
-                    if os.path.splitext(f)[1].lower() in TEMP_EXTS:
-                        continue
-                    if now - _mtime(f) > 4:
-                        ready.append(f)
-                if ready:
-                    self._run_plan(build_plan(self.folder, self.cfg, ready), source="auto")
+            if (self.cfg["bg_enabled"] and self.cfg["watch_folders"]
+                    and not (self.watch_thread and self.watch_thread.is_alive())):
+                self.watch_thread = threading.Thread(target=self._watch_once, daemon=True)
+                self.watch_thread.start()
         except Exception:
             pass
         finally:
-            self.after(AUTO_INTERVAL_MS, self._auto_tick)
+            self.after(WATCH_INTERVAL_MS, self._watch_tick)
+
+    def _watch_once(self):
+        """Runs in a worker thread: sorts new files in every enabled watched folder."""
+        wcfg = dict(self.cfg)
+        wcfg["include_sub"] = False  # the background watcher only touches files directly in the folder
+        for item in list(self.cfg["watch_folders"]):
+            if not item.get("enabled", True):
+                continue
+            root = item.get("path", "")
+            if not root or not os.path.isdir(root):
+                continue
+            if not self.work_lock.acquire(blocking=False):
+                return
+            try:
+                now = time.time()
+                ready = []
+                for f in collect_files(root, wcfg):
+                    if os.path.splitext(f)[1].lower() in TEMP_EXTS:
+                        continue
+                    if now - _mtime(f) > 4 and not is_busy_file(f):
+                        ready.append(f)
+                if not ready:
+                    continue
+                moves, _errors = execute_plan(root, build_plan(root, wcfg, ready), wcfg)
+                if moves:
+                    append_log([log_entry("move", old, new) for new, old, _c in moves])
+                    self.ui_queue.put(("moved", root, moves))
+            except Exception:
+                pass
+            finally:
+                self.work_lock.release()
+
+    def _on_bg_moved(self, root, moves):
+        if register_category_folders(self.cfg, root, {c for _d, _s, c in moves}):
+            save_config(self.cfg)
+        if os.path.normcase(os.path.normpath(root)) == os.path.normcase(os.path.normpath(self.folder or "")):
+            self.recent = Counter(cat for _d, _s, cat in moves)
+            self.refresh(status=False)
+            self.status.configure(text=f"Auto-organized {len(moves)} new file(s).")
+        for note in build_notifications(root, moves):
+            self.show_toast(note)
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self.ui_queue.get_nowait()
+                try:
+                    kind = msg[0]
+                    if kind == "moved":
+                        self._on_bg_moved(msg[1], msg[2])
+                    elif kind == "show":
+                        self.show_window()
+                    elif kind == "toggle_bg":
+                        self.var_bg.set(not self.var_bg.get())
+                        self._on_bg_toggle()
+                    elif kind == "quit":
+                        self._quit()
+                        return
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.after(200, self._poll_queue)
+
+    # ------------------------------------------------------------ tray / window
+    def _start_tray(self):
+        if not HAS_TRAY:
+            return
+        try:
+            image = make_folder_glyph("#378ADD")
+            menu = pystray.Menu(
+                pystray.MenuItem("Open File Organizer", lambda icon, item: self.ui_queue.put(("show",)), default=True),
+                pystray.MenuItem("Auto-organize in background", lambda icon, item: self.ui_queue.put(("toggle_bg",)),
+                                 checked=lambda item: self.cfg["bg_enabled"]),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Exit", lambda icon, item: self.ui_queue.put(("quit",))),
+            )
+            self.tray = pystray.Icon(APP_NAME, image, "File Organizer", menu)
+            self.tray.run_detached()
+        except Exception:
+            self.tray = None
+
+    def show_window(self):
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.focus_force()
+
+    def _on_close(self):
+        watching = self.cfg["bg_enabled"] and any(w.get("enabled", True) for w in self.cfg["watch_folders"])
+        if self.tray and self.cfg["close_to_tray"] and watching:
+            self.withdraw()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.show_toast({"title": "File Organizer", "folder": "", "select": [],
+                                 "text": "Still running in the tray. Right-click the tray icon to exit."})
+            return
+        self._quit()
+
+    def _quit(self):
+        self.cfg["last_folder"] = self.folder
+        save_config(self.cfg)
+        try:
+            self.work_lock.acquire(timeout=5)
+        except Exception:
+            pass
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+        for t in list(self.toasts):
+            try:
+                t["win"].destroy()
+            except Exception:
+                pass
+        self.destroy()
+
+    # ------------------------------------------------------------ pop-up notification
+    def test_notification(self):
+        folder = self.folder if self._folder_ok() else os.path.expanduser("~")
+        self.show_toast({"title": "Files organized", "text": "3 files moved to Pictures",
+                         "folder": folder, "select": []})
+
+    def show_toast(self, note):
+        if not self.cfg.get("notify", True):
+            return
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg = "#2b2b2b" if dark else "#ffffff"
+        fg = "#f0f0f0" if dark else "#1a1a1a"
+        sub = "#a8a8a8" if dark else "#555555"
+        border = "#4a4a4a" if dark else "#c8c8c8"
+        link = "#6cb0ff" if dark else ACCENT
+
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=border)
+        inner = tk.Frame(win, bg=bg, padx=14, pady=10)
+        inner.pack(padx=1, pady=1, fill="both", expand=True)
+
+        head = tk.Frame(inner, bg=bg)
+        head.pack(fill="x")
+        tk.Label(head, text=note["title"], bg=bg, fg=sub, font=("Segoe UI", 9)).pack(side="left")
+        close_btn = tk.Label(head, text="×", bg=bg, fg=sub, font=("Segoe UI", 14), cursor="hand2")
+        close_btn.pack(side="right")
+        tk.Label(inner, text=note["text"], bg=bg, fg=fg, font=("Segoe UI", 10, "bold"),
+                 anchor="w", justify="left", wraplength=300).pack(fill="x", pady=(2, 0))
+        folder = note.get("folder", "")
+        if folder:
+            tk.Label(inner, text=short_path(folder, 58), bg=bg, fg=sub, font=("Segoe UI", 9),
+                     anchor="w", justify="left", wraplength=300).pack(fill="x")
+            open_lbl = tk.Label(inner, text="Open folder", bg=bg, fg=link, cursor="hand2",
+                                font=("Segoe UI", 9, "underline"), anchor="w")
+            open_lbl.pack(anchor="w", pady=(6, 0))
+        else:
+            open_lbl = None
+
+        entry = {"win": win}
+        state = {"job": None}
+
+        def close(_e=None):
+            if state["job"]:
+                try:
+                    win.after_cancel(state["job"])
+                except Exception:
+                    pass
+                state["job"] = None
+            if entry in self.toasts:
+                self.toasts.remove(entry)
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._layout_toasts()
+
+        def open_it(_e=None):
+            open_in_explorer(folder, note.get("select"))
+            close()
+
+        def start_timer(_e=None):
+            if state["job"]:
+                try:
+                    win.after_cancel(state["job"])
+                except Exception:
+                    pass
+            state["job"] = win.after(NOTIFY_SECONDS * 1000, close)
+
+        def stop_timer(_e=None):
+            if state["job"]:
+                try:
+                    win.after_cancel(state["job"])
+                except Exception:
+                    pass
+                state["job"] = None
+
+        close_btn.bind("<Button-1>", close)
+        if open_lbl is not None:
+            open_lbl.bind("<Button-1>", open_it)
+        for w in (win, inner, head, *inner.winfo_children(), *head.winfo_children()):
+            w.bind("<Enter>", stop_timer, add="+")
+            w.bind("<Leave>", start_timer, add="+")
+
+        self.toasts.append(entry)
+        win.update_idletasks()
+        entry["h"] = win.winfo_reqheight()
+        entry["w"] = win.winfo_reqwidth()
+        self._layout_toasts()
+        win.deiconify()
+        start_timer()
+
+    def _layout_toasts(self):
+        """Stack the pop-ups in the bottom-right corner, newest at the bottom."""
+        try:
+            left, top, right, bottom = work_area(self)
+        except Exception:
+            return
+        y = bottom - 16
+        for entry in reversed(self.toasts):
+            w, h = entry.get("w", 330), entry.get("h", 90)
+            y -= h
+            try:
+                entry["win"].geometry(f"{w}x{h}+{right - w - 16}+{y}")
+            except Exception:
+                pass
+            y -= 10
 
     # ------------------------------------------------------------ helpers for dialogs
     def _toplevel(self, title, w, h):
@@ -774,6 +1919,83 @@ class App(ctk.CTk):
                 self.after(150, poll)
 
         self.after(150, poll)
+
+    # ------------------------------------------------------------ auto-manage folders
+    def open_watch(self):
+        win = self._toplevel("Auto-manage folders", 700, 500)
+        ctk.CTkLabel(win, justify="left", wraplength=650, text_color=("gray35", "gray70"),
+                     text="These folders are sorted automatically in the background, even when the window is "
+                          "closed. Only files directly inside each folder are moved, and files that are still "
+                          "downloading are skipped. They use the same categories and options as the rest of the app."
+                     ).pack(anchor="w", padx=16, pady=(14, 6))
+        frame, tree = self._make_tree(win, [("path", "Folder"), ("status", "Status")], [520, 120], selectmode="browse")
+        frame.pack(fill="both", expand=True, padx=16, pady=6)
+
+        def reload():
+            tree.delete(*tree.get_children())
+            for i, w in enumerate(self.cfg["watch_folders"]):
+                if not os.path.isdir(w.get("path", "")):
+                    status = "Missing"
+                elif w.get("enabled", True):
+                    status = "Watching"
+                else:
+                    status = "Paused"
+                tree.insert("", "end", iid=str(i), values=(w.get("path", ""), status))
+            self._update_bg_label()
+
+        def commit():
+            save_config(self.cfg)
+            reload()
+
+        def add():
+            path = filedialog.askdirectory(parent=win, title="Choose a folder to manage automatically")
+            if not path:
+                return
+            path = os.path.normpath(path)
+            reason = unsafe_watch_folder(path)
+            if reason:
+                messagebox.showwarning("Auto-manage", f"That is {reason}. Choose a normal folder such as Downloads.", parent=win)
+                return
+            if any(os.path.normcase(w["path"]) == os.path.normcase(path) for w in self.cfg["watch_folders"]):
+                messagebox.showinfo("Auto-manage", "That folder is already in the list.", parent=win)
+                return
+            if not messagebox.askyesno(
+                    "Auto-manage",
+                    f"Files already in this folder will be sorted right away, and new files will be sorted as "
+                    f"they arrive:\n\n{path}\n\nContinue?", parent=win):
+                return
+            self.cfg["watch_folders"].append({"path": path, "enabled": True})
+            register_existing_categories(self.cfg, path)
+            commit()
+
+        def selected_index():
+            sel = tree.selection()
+            return int(sel[0]) if sel else None
+
+        def remove():
+            i = selected_index()
+            if i is not None:
+                del self.cfg["watch_folders"][i]
+                commit()
+
+        def toggle():
+            i = selected_index()
+            if i is not None:
+                w = self.cfg["watch_folders"][i]
+                w["enabled"] = not w.get("enabled", True)
+                commit()
+                tree.selection_set(str(i))
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(6, 14))
+        ctk.CTkButton(row, text="Add folder...", width=110, command=add).pack(side="left")
+        ctk.CTkButton(row, text="Pause or resume", width=130, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=toggle).pack(side="left", padx=8)
+        ctk.CTkButton(row, text="Remove", width=90, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=remove).pack(side="left")
+        ctk.CTkSwitch(row, text="Run in background", variable=self.var_bg,
+                      command=lambda: (self._on_bg_toggle(), reload())).pack(side="right")
+        reload()
 
     # ------------------------------------------------------------ custom categories
     def open_categories(self):
@@ -869,6 +2091,74 @@ class App(ctk.CTk):
                       text_color=("gray10", "gray90"), command=on_reset).pack(side="right")
         reload()
 
+    # ------------------------------------------------------------ exclusions
+    def _on_exclude_restored_toggle(self):
+        self.cfg["exclude_restored"] = self.var_exclude_restored.get()
+        save_config(self.cfg)
+
+    def open_exclusions(self):
+        win = self._toplevel("Exclusions", 740, 540)
+        ctk.CTkLabel(win, justify="left", wraplength=690, text_color=("gray35", "gray70"),
+                     text="Excluded files and folders are never moved, by Organize now or by the background "
+                          "organizer. Excluding a folder excludes everything inside it."
+                     ).pack(anchor="w", padx=16, pady=(14, 6))
+        frame, tree = self._make_tree(win, [("path", "Path"), ("kind", "Type")], [580, 90])
+        frame.pack(fill="both", expand=True, padx=16, pady=6)
+
+        def reload():
+            tree.delete(*tree.get_children())
+            for i, p in enumerate(self.cfg["excluded"]):
+                kind = "Folder" if os.path.isdir(p) else ("File" if os.path.exists(p) else "Missing")
+                tree.insert("", "end", iid=str(i), values=(p, kind))
+
+        def commit():
+            save_config(self.cfg)
+            reload()
+            self.refresh(status=False)
+
+        def add_files():
+            paths = filedialog.askopenfilenames(parent=win, title="Choose files to exclude")
+            if paths:
+                add_exclusions(self.cfg, paths)
+                commit()
+
+        def add_folder():
+            path = filedialog.askdirectory(parent=win, title="Choose a folder to exclude")
+            if path:
+                add_exclusions(self.cfg, [path])
+                commit()
+
+        def remove():
+            idx = sorted((int(i) for i in tree.selection()), reverse=True)
+            for i in idx:
+                del self.cfg["excluded"][i]
+            if idx:
+                commit()
+
+        def remove_missing():
+            self.cfg["excluded"] = [p for p in self.cfg["excluded"] if os.path.exists(p)]
+            commit()
+
+        def clear_all():
+            if self.cfg["excluded"] and messagebox.askyesno("Exclusions", "Remove every exclusion?", parent=win):
+                self.cfg["excluded"] = []
+                commit()
+
+        ctk.CTkSwitch(win, text="Automatically exclude files I restore (Undo and Activity log)",
+                      variable=self.var_exclude_restored, command=self._on_exclude_restored_toggle
+                      ).pack(anchor="w", padx=16, pady=(4, 6))
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkButton(row, text="Add files...", width=100, command=add_files).pack(side="left")
+        ctk.CTkButton(row, text="Add folder...", width=110, command=add_folder).pack(side="left", padx=6)
+        ctk.CTkButton(row, text="Remove selected", width=130, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=remove).pack(side="left")
+        ctk.CTkButton(row, text="Clear all", width=90, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=clear_all).pack(side="right")
+        ctk.CTkButton(row, text="Remove missing", width=120, fg_color="transparent", border_width=1,
+                      text_color=("gray10", "gray90"), command=remove_missing).pack(side="right", padx=6)
+        reload()
+
     # ------------------------------------------------------------ ignore list
     def open_ignore(self):
         win = self._toplevel("Ignore list", 440, 400)
@@ -887,106 +2177,72 @@ class App(ctk.CTk):
 
         ctk.CTkButton(win, text="Save", command=save).pack(pady=(6, 14))
 
-    # ------------------------------------------------------------ folder icons
+    # ------------------------------------------------------------ folder icons dialog
     def open_icons(self):
         if os.name != "nt":
             messagebox.showinfo("Folder icons", "Folder icons are only supported on Windows.")
             return
-        win = self._toplevel("Folder icons", 600, 560)
-        ctk.CTkLabel(win, text="Pick an .ico file for each folder, then press Apply icons.",
-                     text_color=("gray35", "gray70")).pack(anchor="w", padx=16, pady=(14, 4))
+        if not self._folder_ok(warn=True):
+            return
+        win = self._toplevel("Folder icons", 660, 560)
+        ctk.CTkLabel(win, justify="left", wraplength=610, text_color=("gray35", "gray70"),
+                     text=f"Icons for the folders inside {short_path(self.folder, 50)}. These only change this "
+                          "folder's own folders. To change several folders, or every folder with the same name, "
+                          "right-click a folder under 'Organized folders'.").pack(anchor="w", padx=16, pady=(14, 4))
         scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=10, pady=4)
 
-        managed_label = "Managed folder"
-        if self._folder_ok():
-            managed_label += f" ({os.path.basename(self.folder) or self.folder})"
-        keys = [("__managed__", managed_label)]
-        keys += [(c, c) for c in self.cfg["categories"]] + [(OTHERS, OTHERS), (DUPES, DUPES)]
+        rows = [(self.folder, f"This folder ({os.path.basename(self.folder) or self.folder})")]
+        rows += [(os.path.join(self.folder, c), c) for c in list(self.cfg["categories"]) + [OTHERS, DUPES]]
+        initial = {p: self.current_icon_for(p) for p, _ in rows}
+        pending = dict(initial)
+        labels = {}
 
-        pending, labels = {}, {}
-        for key, _ in keys:
-            if key == "__managed__":
-                pending[key] = self.cfg["managed_icons"].get(self.folder) if self.folder else None
-            else:
-                pending[key] = self.cfg["icons"].get(key)
+        def text_for(p):
+            return short_text(pending[p]["name"], 20) if pending[p] else "Default icon"
 
-        def text_for(key):
-            return os.path.basename(pending[key]) if pending[key] else "Default icon"
+        def choose(p):
+            def picked(path, name):
+                pending[p] = {"path": path, "name": name}
+                labels[p].configure(text=text_for(p))
+            self.pick_library_icon(picked)
 
-        def choose(key):
-            path = filedialog.askopenfilename(parent=win, title="Choose an icon",
-                                              filetypes=[("Icon files", "*.ico")])
-            if path:
-                if not path.lower().endswith(".ico"):
-                    messagebox.showwarning("Folder icons", "Please choose an .ico file.", parent=win)
-                    return
-                pending[key] = path
-                labels[key].configure(text=text_for(key))
+        def clear(p):
+            pending[p] = None
+            labels[p].configure(text=text_for(p))
 
-        def clear(key):
-            pending[key] = None
-            labels[key].configure(text=text_for(key))
-
-        for key, title in keys:
+        for p, title in rows:
             row = ctk.CTkFrame(scroll, fg_color="transparent")
             row.pack(fill="x", pady=4)
-            ctk.CTkLabel(row, text=title, width=190, anchor="w").pack(side="left")
-            labels[key] = ctk.CTkLabel(row, text=text_for(key), anchor="w", width=130,
-                                       text_color=("gray35", "gray70"))
-            labels[key].pack(side="left", padx=6)
-            ctk.CTkButton(row, text="Choose...", width=84, height=30, command=lambda k=key: choose(k)).pack(side="left")
+            ctk.CTkLabel(row, text=short_text(title, 30), width=210, anchor="w").pack(side="left")
+            labels[p] = ctk.CTkLabel(row, text=text_for(p), anchor="w", width=140, text_color=("gray35", "gray70"))
+            labels[p].pack(side="left", padx=6)
+            ctk.CTkButton(row, text="Choose...", width=84, height=30, command=lambda k=p: choose(k)).pack(side="left")
             ctk.CTkButton(row, text="Clear", width=60, height=30, fg_color="transparent", border_width=1,
-                          text_color=("gray10", "gray90"), command=lambda k=key: clear(k)).pack(side="left", padx=6)
-
-        def store_icon(path, key):
-            os.makedirs(ICON_DIR, exist_ok=True)
-            if key == "__managed__":
-                safe = "managed_" + hashlib.md5(self.folder.encode("utf-8")).hexdigest()[:8]
-            else:
-                safe = re.sub(r"[^\w\-]+", "_", key)
-            dest = os.path.join(ICON_DIR, safe + ".ico")
-            try:
-                shutil.copyfile(path, dest)
-            except shutil.SameFileError:
-                pass
-            return dest
+                          text_color=("gray10", "gray90"), command=lambda k=p: clear(k)).pack(side="left", padx=6)
 
         def apply():
             errors = []
-            for key, _ in keys:
-                path = pending[key]
-                try:
-                    if key == "__managed__":
-                        if not self._folder_ok():
-                            continue
-                        store, skey, target = self.cfg["managed_icons"], self.folder, self.folder
-                    else:
-                        store, skey = self.cfg["icons"], key
-                        target = os.path.join(self.folder, key) if self._folder_ok() else None
-                    if path:
-                        store[skey] = store_icon(path, key)
-                        if target and os.path.isdir(target):
-                            set_folder_icon(target, store[skey])
-                    else:
-                        store.pop(skey, None)
-                        if target and os.path.isdir(target):
-                            reset_folder_icon(target)
-                except OSError as e:
-                    errors.append(f"{key}: {e}")
-            save_config(self.cfg)
+            for p, _ in rows:
+                if pending[p] == initial[p]:
+                    continue
+                if pending[p]:
+                    errors += self.apply_icon_to([p], pending[p]["path"], pending[p]["name"])
+                else:
+                    errors += self.reset_icons([p])
             if errors:
-                messagebox.showwarning("Folder icons", "Some icons couldn't be applied:\n" + "\n".join(errors), parent=win)
+                messagebox.showwarning("Folder icons", "Some icons couldn't be applied:\n" + "\n".join(errors[:6]), parent=win)
             else:
                 messagebox.showinfo("Folder icons",
                                     "Icons applied. If a folder still shows the old icon, press F5 in "
                                     "File Explorer or restart it.", parent=win)
             win.destroy()
+            self.refresh_folders()
 
         def reset_all():
-            for key in pending:
-                pending[key] = None
-                labels[key].configure(text=text_for(key))
+            for p in pending:
+                pending[p] = None
+                labels[p].configure(text=text_for(p))
 
         row = ctk.CTkFrame(win, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(6, 14))
@@ -1121,8 +2377,9 @@ class App(ctk.CTk):
 
         def show():
             sel = tree.selection()
-            if sel and os.name == "nt":
-                subprocess.Popen(["explorer", f"/select,{paths[sel[0]]}"])
+            if sel:
+                p = paths[sel[0]]
+                open_in_explorer(os.path.dirname(p), [os.path.basename(p)])
 
         def delete():
             sel = tree.selection()
@@ -1174,19 +2431,26 @@ class App(ctk.CTk):
             if not sel:
                 messagebox.showinfo("Restore", "Select one or more 'move' entries first.", parent=win)
                 return
-            restored, out = 0, []
+            restored, out, back = 0, [], []
             for e in sel:
                 try:
                     target = restore_file(e["dst"], e["src"])
                     if target:
                         restored += 1
                         out.append(log_entry("restore", e["dst"], target))
+                        back.append(target)
                         if self._folder_ok():
                             cleanup_empty_dirs(os.path.dirname(e["dst"]), self.folder)
                 except OSError:
                     pass
             append_log(out)
-            messagebox.showinfo("Restore", f"Restored {restored} of {len(sel)} file(s).", parent=win)
+            msg = f"Restored {restored} of {len(sel)} file(s)."
+            if back and self.cfg.get("exclude_restored", True):
+                add_exclusions(self.cfg, back)
+                save_config(self.cfg)
+                msg += ("\n\nThey are now excluded from organizing (Options > Exclusions), so the background "
+                        "organizer won't move them again.")
+            messagebox.showinfo("Restore", msg, parent=win)
             reload()
             self.refresh()
 
@@ -1208,13 +2472,22 @@ class App(ctk.CTk):
     def show_help(self):
         messagebox.showinfo(
             "How it works",
-            "1. File > Select folder to choose the folder you want to manage.\n"
-            "2. The list shows where each file will go. Nothing moves until you press Organize now.\n"
-            "3. Options lets you sort by date, rename files, add custom categories, "
-            "set an ignore list and change folder icons.\n"
-            "4. Undo puts the last batch back. The Activity log can restore older moves.\n"
-            "5. Auto-organize sorts new files in the folder every few seconds.")
+            "1. File > Select folder to choose a folder. The 'Items in folder' view shows where each file "
+            "will go. Nothing moves until you press Organize now.\n"
+            "2. After organizing, 'Organized folders' shows your folders. Double-click one to open it; "
+            "right-click to change its icon.\n"
+            "3. Background > Auto-manage folders lets you pick folders (like Downloads) that are sorted "
+            "automatically, even when the window is closed.\n"
+            "4. A small pop-up in the bottom-right corner tells you what moved, with a link that opens the folder.\n"
+            "5. Undo puts the last batch back. The Activity log can restore older moves.")
 
 
 if __name__ == "__main__":
+    if already_running():
+        if not BACKGROUND_START:
+            _r = tk.Tk()
+            _r.withdraw()
+            messagebox.showinfo("File Organizer", "File Organizer is already running. "
+                                                  "Look for its icon in the system tray, next to the clock.")
+        sys.exit(0)
     App().mainloop()
