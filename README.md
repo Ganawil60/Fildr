@@ -8,6 +8,9 @@ Built with Python and [customtkinter](https://github.com/TomSchimansky/CustomTki
 
 > **Windows only.** Fildr runs on Windows 10 and 11 PCs. It does not work on Android, iPhone, or Mac.
 
+<img width="1393" height="982" alt="image" src="https://github.com/user-attachments/assets/5b18da93-ec48-4e44-8b26-d654b461831d" />
+
+
 ## Download
 
 Get the latest `Fildr.exe` from the [Releases](../../releases) page. No installation needed.
@@ -99,45 +102,6 @@ Good to know:
 - Right-click an item under **Items in folder** and choose **Exclude this file**, or **Exclude the folder** to leave everything inside it alone. Excluded items show as "Skipped (excluded)".
 - **Settings > Exclusions** lists everything excluded, where you can add files or folders, remove entries, or clear the list.
 - A restored file is added to the list automatically. Turn this off with the switch in the same window. After **Undo**, restored files stay excluded until you remove them there (or right-click them and choose **Include in organizing again**).
-
-## For developers
-
-### Requirements
-
-- Python 3.9 or newer
-- Windows (the app starts elsewhere, but folder icons, the tray icon, and Explorer features are Windows-only)
-
-### Run from source
-
-1. Clone or download this repository.
-2. Install the dependencies:
-   ```
-   python -m pip install customtkinter pystray pillow
-   ```
-3. Create an `icons` folder next to `file_organizer.py` and put your `.ico` files in it.
-4. Run the app:
-   ```
-   python file_organizer.py
-   ```
-
-### Build the .exe
-
-1. Install PyInstaller:
-   ```
-   python -m pip install pyinstaller
-   ```
-2. Make sure the `icons` folder exists next to `file_organizer.py` with at least one `.ico` file, and that `fildr.ico` (the logo) is in the same folder.
-3. Build:
-   ```
-   python -m PyInstaller --onefile --windowed --collect-all customtkinter --hidden-import pystray._win32 --add-data "icons;icons" --icon fildr.ico --name Fildr file_organizer.py
-   ```
-4. Your app is at `dist\Fildr.exe`.
-
-> Windows Defender or other antivirus software may flag a PyInstaller-built .exe as suspicious. This is a common false positive. You can build it yourself from the source in this repository.
-
-## Where settings are stored
-
-Settings, the activity log, and copies of your chosen icons are saved in `%APPDATA%\Fildr`. If you used an earlier version (File Organizer), your settings are copied over the first time Fildr starts. Deleting the folder resets the app to its defaults. The **Start with Windows** option adds one entry to your user's login items, and turning it off removes it.
 
 ## Roadmap
 
