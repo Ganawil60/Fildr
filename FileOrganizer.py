@@ -1,5 +1,5 @@
 """
-File Organizer
+Fildr  |  Fill. Folder. Done.
 Sorts files into folders (Pictures, Videos, Docs, ...) with a modern UI.
 
 Features: two-view preview (items / organized folders), double-click and right-click
@@ -11,8 +11,8 @@ light/dark theme.
 
 Requires:  pip install customtkinter pystray pillow
 Icons:     put your .ico files in an "icons" folder next to this file (they get bundled into the .exe).
-           Users of the .exe can add their own in %APPDATA%\\FileOrganizer\\my-icons (Help > Open icons folder).
-Build exe: python -m PyInstaller --onefile --windowed --collect-all customtkinter --hidden-import pystray._win32 --add-data "icons;icons" --name FileOrganizer file_organizer.py
+           Users of the .exe can add their own in %APPDATA%\\Fildr\\my-icons (Help > Open icons folder).
+Build exe: python -m PyInstaller --onefile --windowed --collect-all customtkinter --hidden-import pystray._win32 --add-data "icons;icons" --icon fildr.ico --name Fildr file_organizer.py
 """
 
 import os
@@ -31,7 +31,9 @@ import ctypes
 from datetime import datetime
 from collections import Counter, defaultdict
 
-APP_NAME = "FileOrganizer"
+APP_NAME = "Fildr"
+TAGLINE = "Fill. Folder. Done."
+LEGACY_APP_NAMES = ["FileOrganizer", "Sortify"]  # older names: settings are carried over, login entries removed
 OTHERS = "Others"
 DUPES = "Duplicates"
 ICON_FILE = ".foldericon.ico"
@@ -88,7 +90,38 @@ NUM_PREFIX_RE = re.compile(r"^\d{3,}_")
 # ENGINE (no GUI code here)
 # =====================================================================
 
+def migrate_legacy_data():
+    """First run under the new name: copy settings, log and icons from an older app folder (the old one is left alone)."""
+    if os.path.exists(CONFIG_PATH):
+        return
+    base = os.path.dirname(CONFIG_DIR)
+    for old in LEGACY_APP_NAMES:
+        old_dir = os.path.join(base, old)
+        if os.path.isfile(os.path.join(old_dir, "config.json")):
+            try:
+                shutil.copytree(old_dir, CONFIG_DIR, dirs_exist_ok=True)
+                try:  # stored icon paths pointed into the old folder; follow the copy
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    old_prefix = os.path.join(old_dir, "icons")
+                    new_prefix = os.path.join(CONFIG_DIR, "icons")
+                    for entry in list(data.get("folder_icons", {}).values()) + list(data.get("icons", {}).values()):
+                        if isinstance(entry, dict) and str(entry.get("icon", "")).startswith(old_prefix):
+                            entry["icon"] = new_prefix + entry["icon"][len(old_prefix):]
+                    for k, v in list(data.get("icons", {}).items()):
+                        if isinstance(v, str) and v.startswith(old_prefix):
+                            data["icons"][k] = new_prefix + v[len(old_prefix):]
+                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2)
+                except Exception:
+                    pass
+            except OSError:
+                pass
+            return
+
+
 def load_config():
+    migrate_legacy_data()
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -427,7 +460,7 @@ def app_dir():
 
 
 def user_icons_dir():
-    """Where users drop their own .ico files: %APPDATA%\\FileOrganizer\\my-icons (C: drive, out of sight)."""
+    """Where users drop their own .ico files: %APPDATA%\\Fildr\\my-icons (C: drive, out of sight)."""
     return os.path.join(CONFIG_DIR, "my-icons")
 
 
@@ -714,6 +747,11 @@ def set_startup(enabled):
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
         try:
+            for old in LEGACY_APP_NAMES:  # remove login entries made under an older name
+                try:
+                    winreg.DeleteValue(key, old)
+                except OSError:
+                    pass
             if enabled:
                 winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
             else:
@@ -740,7 +778,7 @@ def already_running():
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.restype = ctypes.c_void_p
         k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-        _mutex_handle = k32.CreateMutexW(None, False, "Local\\FileOrganizerSingleInstance")
+        _mutex_handle = k32.CreateMutexW(None, False, "Local\\FildrSingleInstance")
         return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
     except Exception:
         return False
@@ -763,7 +801,9 @@ def work_area(root):
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
+import base64
+import io
 
 try:
     import pystray
@@ -772,19 +812,83 @@ except Exception:
     pystray = None
     HAS_TRAY = False
 
+LOGO_B64 = "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"
+
+# ---- Fildr palette (Mint Fresh). Pairs are (light mode, dark mode).
+MINT = "#10B981"
+MINT_HOVER = "#0EA371"
+ON_MINT = "#04251A"
+SIDEBAR_BG = "#0C2A23"
+SIDEBAR_ACTIVE = "#15463A"
+SIDEBAR_TEXT = "#9CC4B6"
+BG = ("#F2F9F6", "#0F1A17")
+CARD = ("#FFFFFF", "#16251F")
+CARD_ALT = ("#EAF6F0", "#1B2E27")
+LINE = ("#D5EBE1", "#25392F")
+TEXT = ("#10231C", "#E8F5EF")
+MUTED = ("#4B6358", "#9DB8AC")
 CARD_STYLES = [
-    {"bg": ("#E6F1FB", "#0C447C"), "fg": ("#0C447C", "#B5D4F4")},
-    {"bg": ("#FAEEDA", "#633806"), "fg": ("#633806", "#FAC775")},
-    {"bg": ("#EAF3DE", "#27500A"), "fg": ("#27500A", "#C0DD97")},
-    {"bg": ("#F1EFE8", "#444441"), "fg": ("#444441", "#D3D1C7")},
+    {"bg": ("#DDF5EA", "#0F3D2E"), "fg": ("#0A6B4B", "#8EE8C4")},
+    {"bg": ("#FFE8E3", "#4A2018"), "fg": ("#A63A28", "#FFB4A6")},
+    {"bg": ("#FFF3D6", "#4A3810"), "fg": ("#8A5E00", "#FFD98A")},
+    {"bg": ("#E6ECFF", "#1F2A55"), "fg": ("#2F3F9E", "#B9C6FF")},
 ]
-FOLDER_COLORS = ["#378ADD", "#BA7517", "#639922", "#7F77DD", "#D85A30", "#1D9E75", "#D4537E", "#888780"]
+FOLDER_COLORS = ["#10B981", "#FF6B57", "#FFB629", "#4361F2", "#19C3B1", "#8B5CF6", "#F472B6", "#64748B"]
 INVALID_NAME_CHARS = set('\\/:*?"<>|')
 VIEW_ITEMS = "Items in folder"
 VIEW_FOLDERS = "Organized folders"
 FOLDER_COLS = 4
-ACCENT = "#1f6aa5"
-NEUTRAL_BORDER = ("gray75", "gray35")
+ACCENT = "#0E9F6E"
+NEUTRAL_BORDER = LINE
+
+
+
+def logo_pil(size=64):
+    im = Image.open(io.BytesIO(base64.b64decode(LOGO_B64))).convert("RGBA")
+    return im.resize((size, size), Image.LANCZOS) if size != im.width else im
+
+
+def logo_ico_path():
+    """Writes the logo as an .ico into the settings folder (used for window icons) and returns its path."""
+    path = os.path.join(CONFIG_DIR, "fildr.ico")
+    if not os.path.exists(path):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            logo_pil(128).save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128)])
+        except Exception:
+            return ""
+    return path
+
+
+def apply_theme_colors():
+    """Make every customtkinter widget use the Fildr palette by default."""
+    ctk.set_default_color_theme("green")
+    t = ctk.ThemeManager.theme
+
+    def put(widget, **kw):
+        if widget in t:
+            t[widget].update(kw)
+
+    put("CTk", fg_color=list(BG))
+    put("CTkToplevel", fg_color=list(BG))
+    put("CTkFrame", fg_color=list(CARD), top_fg_color=list(CARD_ALT), border_color=list(LINE), corner_radius=14)
+    put("CTkButton", fg_color=MINT, hover_color=MINT_HOVER, text_color=ON_MINT, border_color=list(LINE),
+        corner_radius=10)
+    put("CTkLabel", text_color=list(TEXT))
+    put("CTkEntry", fg_color=list(CARD), border_color=list(LINE), text_color=list(TEXT), corner_radius=10)
+    put("CTkCheckBox", fg_color=MINT, hover_color=MINT_HOVER, border_color=["#7FB9A2", "#3C5A4D"],
+        checkmark_color=ON_MINT, text_color=list(TEXT), corner_radius=6)
+    put("CTkRadioButton", fg_color=MINT, hover_color=MINT_HOVER, border_color=["#7FB9A2", "#3C5A4D"],
+        text_color=list(TEXT))
+    put("CTkSwitch", progress_color=MINT, button_color=["#FFFFFF", "#E8F5EF"], button_hover_color=["#F2F2F2", "#FFFFFF"],
+        fg_color=["#C5D6CE", "#3A4A43"], text_color=list(TEXT), switch_width=46, switch_height=26,
+        corner_radius=13, button_length=0, border_width=3)
+    put("CTkProgressBar", progress_color=MINT, fg_color=list(LINE))
+    put("CTkSegmentedButton", fg_color=list(CARD_ALT), selected_color=[MINT, "#0B7A57"], selected_hover_color=[MINT_HOVER, "#0A6A4B"],
+        unselected_color=list(CARD_ALT), unselected_hover_color=list(LINE), text_color=list(TEXT),
+        text_color_disabled=list(MUTED))
+    put("CTkScrollbar", button_color=["#BFD8CD", "#35493F"], button_hover_color=[MINT, MINT])
+    put("CTkScrollableFrame", label_fg_color=list(CARD_ALT))
 
 
 def darken(hex_color, factor=0.78):
@@ -806,16 +910,82 @@ def folder_color(name):
     return FOLDER_COLORS[zlib.crc32(name.encode("utf-8")) % len(FOLDER_COLORS)]
 
 
+
+NAV = [("organize", "Organize"), ("auto", "Auto-manage"), ("tools", "Tools"), ("settings", "Settings"), ("help", "Help")]
+
+
+def draw_icon(kind, color, px=22):
+    """Simple flat line icons drawn with Pillow (no image files needed)."""
+    import math
+    S = 4
+    n = px * S
+    im = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    w = max(2, int(n * 0.085))
+
+    def b(x0, y0, x1, y1):
+        return [x0 * n, y0 * n, x1 * n, y1 * n]
+
+    if kind == "organize":
+        d.rounded_rectangle(b(.1, .27, .9, .82), radius=n * .09, outline=color, width=w)
+        d.line([(.13 * n, .27 * n), (.13 * n, .18 * n), (.4 * n, .18 * n), (.5 * n, .27 * n)], fill=color, width=w, joint="curve")
+        d.line([(.1 * n, .45 * n), (.9 * n, .45 * n)], fill=color, width=w)
+    elif kind == "auto":
+        d.arc(b(.16, .16, .84, .84), start=35, end=325, fill=color, width=w)
+        th = math.radians(325)
+        cx, cy, r = .5, .5, .34
+        px_, py_ = cx + r * math.cos(th), cy + r * math.sin(th)
+        tx, ty = -math.sin(th), math.cos(th)
+        nx, ny = math.cos(th), math.sin(th)
+        tip = (px_ + .17 * tx, py_ + .17 * ty)
+        c1 = (px_ + .11 * nx, py_ + .11 * ny)
+        c2 = (px_ - .11 * nx, py_ - .11 * ny)
+        d.polygon([(tip[0] * n, tip[1] * n), (c1[0] * n, c1[1] * n), (c2[0] * n, c2[1] * n)], fill=color)
+    elif kind == "tools":
+        d.ellipse(b(.14, .14, .64, .64), outline=color, width=w)
+        d.line([(.58 * n, .58 * n), (.88 * n, .88 * n)], fill=color, width=w + 1)
+    elif kind == "settings":
+        for y, kx in ((.25, .32), (.5, .66), (.75, .42)):
+            d.line([(.12 * n, y * n), (.88 * n, y * n)], fill=color, width=w)
+            d.ellipse(b(kx - .1, y - .1, kx + .1, y + .1), fill=color)
+    elif kind == "help":
+        d.ellipse(b(.1, .1, .9, .9), outline=color, width=w)
+        d.ellipse(b(.46, .26, .54, .34), fill=color)
+        d.line([(.5 * n, .44 * n), (.5 * n, .72 * n)], fill=color, width=w)
+    elif kind == "dupes":
+        d.rounded_rectangle(b(.1, .1, .62, .62), radius=n * .07, outline=color, width=w)
+        d.rounded_rectangle(b(.38, .38, .9, .9), radius=n * .07, outline=color, width=w, fill=(0, 0, 0, 0))
+    elif kind == "large":
+        for x0, top in ((.12, .5), (.4, .22), (.68, .62)):
+            d.rounded_rectangle(b(x0, top, x0 + .2, .86), radius=n * .04, fill=color)
+    elif kind == "log":
+        for y in (.25, .5, .75):
+            d.ellipse(b(.1, y - .05, .2, y + .05), fill=color)
+            d.line([(.32 * n, y * n), (.9 * n, y * n)], fill=color, width=w)
+    return im.resize((px, px), Image.LANCZOS)
+
+
+def tile_icon(kind, color, soft, px=112):
+    """A rounded soft-colored square with a glyph in the middle (used on the Tools cards)."""
+    im = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle([0, 0, px - 1, px - 1], radius=int(px * .28), fill=soft)
+    g = draw_icon(kind, color, int(px * .56))
+    im.paste(g, ((px - g.width) // 2, (px - g.height) // 2), g)
+    return im
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.cfg = load_config()
         ctk.set_appearance_mode(self.cfg["theme"])
-        ctk.set_default_color_theme("blue")
+        apply_theme_colors()
 
-        self.title("File Organizer")
-        self.geometry("980x720")
-        self.minsize(860, 620)
+        self.title("Fildr")
+        self._set_window_icon(self)
+        self.geometry("1120x760")
+        self.minsize(980, 660)
 
         self.folder = self.cfg.get("last_folder", "")
         self.plan = []
@@ -844,7 +1014,8 @@ class App(ctk.CTk):
         self.var_notify = tk.BooleanVar(value=self.cfg["notify"])
         self.var_exclude_restored = tk.BooleanVar(value=self.cfg["exclude_restored"])
 
-        self._build_menu()
+        self.pages = {}
+        self.current_page = "organize"
         self._build_ui()
         self.apply_tree_style()
 
@@ -863,7 +1034,7 @@ class App(ctk.CTk):
         if self._folder_ok():
             self.refresh()
         else:
-            self.status.configure(text="Select a folder to begin (File > Select folder).")
+            self.status.configure(text="Select a folder to begin (click Browse).")
             self.refresh_folders()
         self._update_bg_label()
 
@@ -876,111 +1047,132 @@ class App(ctk.CTk):
         self.after(200, self._poll_queue)
         self.after(WATCH_INTERVAL_MS, self._watch_tick)
 
-    # ------------------------------------------------------------ menus / layout
-    def _build_menu(self):
-        bar = tk.Menu(self)
+    def _set_window_icon(self, win):
+        """Use the Fildr logo for the window and taskbar (customtkinter sets its own icon after ~200 ms)."""
+        ico = logo_ico_path()
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Select folder...", accelerator="Ctrl+O", command=self.select_folder)
-        m.add_command(label="Open folder in Explorer", command=lambda: self.open_path(self.folder))
-        m.add_separator()
-        m.add_command(label="Exit", command=self._quit)
-        bar.add_cascade(label="File", menu=m)
+        def apply():
+            try:
+                if ico and os.name == "nt":
+                    win.iconbitmap(ico)
+                else:
+                    self._icon_photo = ImageTk.PhotoImage(logo_pil(64))
+                    win.iconphoto(True, self._icon_photo)
+            except Exception:
+                pass
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Organize now", accelerator="Ctrl+R", command=self.organize)
-        m.add_command(label="Undo last organize", accelerator="Ctrl+Z", command=self.undo)
-        m.add_command(label="Refresh", accelerator="F5", command=self.refresh)
-        bar.add_cascade(label="Actions", menu=m)
+        win.after(300, apply)
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Find duplicate files...", command=self.open_duplicates)
-        m.add_command(label="Find large files...", command=self.open_large_files)
-        m.add_command(label="Activity log...", command=self.open_log)
-        bar.add_cascade(label="Tools", menu=m)
+    # ------------------------------------------------------------ layout: sidebar + pages
+    def _img(self, pil, size):
+        return ctk.CTkImage(light_image=pil, dark_image=pil, size=(size, size))
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Auto-manage folders...", command=self.open_watch)
-        m.add_checkbutton(label="Auto-organize in background", variable=self.var_bg, command=self._on_bg_toggle)
-        m.add_separator()
-        m.add_checkbutton(label="Start with Windows", variable=self.var_startup, command=self._on_startup_toggle)
-        m.add_checkbutton(label="Keep running in the tray when the window is closed",
-                          variable=self.var_tray, command=self._on_tray_toggle)
-        m.add_checkbutton(label="Show pop-up notifications", variable=self.var_notify, command=self._on_notify_toggle)
-        m.add_separator()
-        m.add_command(label="Send a test notification", command=self.test_notification)
-        bar.add_cascade(label="Background", menu=m)
+    def _nav_icon(self, kind, color):
+        key = ("nav", kind, color)
+        if key not in self._img_cache:
+            self._img_cache[key] = self._img(draw_icon(kind, color, 44), 22)
+        return self._img_cache[key]
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_checkbutton(label="Include subfolders", variable=self.var_sub, command=self._on_sub_toggle)
-        date_menu = tk.Menu(m, tearoff=0)
-        for label, val in (("Off", "off"), ("By year", "year"), ("By year and month", "month")):
-            date_menu.add_radiobutton(label=label, value=val, variable=self.var_date, command=self._on_option_change)
-        m.add_cascade(label="Sort by date", menu=date_menu)
-        ren_menu = tk.Menu(m, tearoff=0)
-        for label, val in (("Keep original names", "off"), ("Add date prefix (2026-11-01_name)", "date"),
-                           ("Add number prefix (001_name)", "number")):
-            ren_menu.add_radiobutton(label=label, value=val, variable=self.var_rename, command=self._on_option_change)
-        m.add_cascade(label="Rename files", menu=ren_menu)
-        m.add_separator()
-        m.add_command(label="Custom categories...", command=self.open_categories)
-        m.add_command(label="Ignore list...", command=self.open_ignore)
-        m.add_command(label="Exclusions...", command=self.open_exclusions)
-        m.add_command(label="Folder icons...", command=self.open_icons)
-        m.add_separator()
-        theme_menu = tk.Menu(m, tearoff=0)
-        for label in ("System", "Light", "Dark"):
-            theme_menu.add_radiobutton(label=label, value=label, variable=self.var_theme, command=self._on_theme)
-        m.add_cascade(label="Theme", menu=theme_menu)
-        bar.add_cascade(label="Options", menu=m)
+    def _card(self, parent, **kw):
+        return ctk.CTkFrame(parent, corner_radius=16, fg_color=CARD, border_width=1, border_color=LINE, **kw)
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="How it works", command=self.show_help)
-        m.add_command(label="Open icons folder", command=open_icons_folder)
-        m.add_command(label="About", command=lambda: messagebox.showinfo(
-            "About", "File Organizer\nSorts files into folders by type.\nBuilt with Python and customtkinter."))
-        bar.add_cascade(label="Help", menu=m)
-
-        self.configure(menu=bar)
+    def _page_header(self, page, title, subtitle):
+        head = ctk.CTkFrame(page, fg_color="transparent")
+        head.pack(fill="x", padx=28, pady=(24, 12))
+        left = ctk.CTkFrame(head, fg_color="transparent")
+        left.pack(side="left")
+        ctk.CTkLabel(left, text=title, font=ctk.CTkFont(size=26, weight="bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(left, text=subtitle, text_color=MUTED, anchor="w").pack(anchor="w")
+        return head
 
     def _build_ui(self):
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=16, pady=(16, 8))
-        ctk.CTkEntry(top, textvariable=self.var_path, state="readonly", height=36).pack(
-            side="left", fill="x", expand=True)
-        ctk.CTkButton(top, text="Browse", width=90, height=36, command=self.select_folder).pack(side="left", padx=(8, 0))
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        cards = ctk.CTkFrame(self, fg_color="transparent")
-        cards.pack(fill="x", padx=16, pady=4)
+        side = ctk.CTkFrame(self, width=236, corner_radius=0, fg_color=SIDEBAR_BG)
+        side.grid(row=0, column=0, sticky="nsew")
+        side.grid_propagate(False)
+        ctk.CTkLabel(side, text="", image=self._img(logo_pil(128), 68)).pack(pady=(28, 8))
+        ctk.CTkLabel(side, text="Fildr", font=ctk.CTkFont(size=26, weight="bold"), text_color="#FFFFFF").pack()
+        ctk.CTkLabel(side, text=TAGLINE, font=ctk.CTkFont(size=12), text_color=SIDEBAR_TEXT).pack(pady=(0, 26))
+        self.nav_btns = {}
+        for key, label in NAV:
+            btn = ctk.CTkButton(side, text="  " + label, anchor="w", height=46, corner_radius=12,
+                                fg_color="transparent", hover_color=SIDEBAR_ACTIVE, text_color=SIDEBAR_TEXT,
+                                font=ctk.CTkFont(size=14), image=self._nav_icon(key, SIDEBAR_TEXT),
+                                command=lambda k=key: self.show_page(k))
+            btn.pack(fill="x", padx=14, pady=3)
+            self.nav_btns[key] = btn
+        self.side_bg = ctk.CTkLabel(side, text="", text_color=SIDEBAR_TEXT, font=ctk.CTkFont(size=12),
+                                    wraplength=190, justify="left", anchor="w")
+        self.side_bg.pack(side="bottom", fill="x", padx=20, pady=20)
+
+        host = ctk.CTkFrame(self, corner_radius=0, fg_color=BG)
+        host.grid(row=0, column=1, sticky="nsew")
+        self.pages = {}
+        for key, _label in NAV:
+            self.pages[key] = ctk.CTkFrame(host, corner_radius=0, fg_color="transparent")
+        self._build_organize_page(self.pages["organize"])
+        self._build_auto_page(self.pages["auto"])
+        self._build_tools_page(self.pages["tools"])
+        self._build_settings_page(self.pages["settings"])
+        self._build_help_page(self.pages["help"])
+        self.show_page("organize")
+
+    def show_page(self, key):
+        for p in self.pages.values():
+            p.pack_forget()
+        self.pages[key].pack(fill="both", expand=True)
+        for k, btn in self.nav_btns.items():
+            on = k == key
+            btn.configure(fg_color=SIDEBAR_ACTIVE if on else "transparent",
+                          text_color="#FFFFFF" if on else SIDEBAR_TEXT,
+                          image=self._nav_icon(k, MINT if on else SIDEBAR_TEXT))
+        self.current_page = key
+        if key == "auto":
+            self.reload_watch_page()
+
+    # ---- Organize page
+    def _build_organize_page(self, page):
+        self._page_header(page, "Organize", "Pick a folder, check the preview, then press Organize now.")
+
+        top = self._card(page)
+        top.pack(fill="x", padx=28, pady=(0, 12))
+        ctk.CTkEntry(top, textvariable=self.var_path, state="readonly", height=40, border_width=0,
+                     fg_color="transparent").pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
+        ctk.CTkButton(top, text="Browse", width=96, height=38, command=self.select_folder).pack(side="left", padx=(0, 8), pady=8)
+
+        cards = ctk.CTkFrame(page, fg_color="transparent")
+        cards.pack(fill="x", padx=28, pady=4)
         self.card_name, self.card_count = [], []
         for i, style in enumerate(CARD_STYLES):
             cards.grid_columnconfigure(i, weight=1, uniform="card")
-            card = ctk.CTkFrame(cards, fg_color=style["bg"], corner_radius=10)
+            card = ctk.CTkFrame(cards, fg_color=style["bg"], corner_radius=16, border_width=0)
             card.grid(row=0, column=i, padx=(0 if i == 0 else 6, 0 if i == 3 else 6), sticky="ew")
             name = ctk.CTkLabel(card, text="-", text_color=style["fg"], font=ctk.CTkFont(size=12), anchor="w")
-            name.pack(fill="x", padx=12, pady=(8, 0))
-            count = ctk.CTkLabel(card, text="0", text_color=style["fg"], font=ctk.CTkFont(size=22, weight="bold"), anchor="w")
-            count.pack(fill="x", padx=12, pady=(0, 8))
+            name.pack(fill="x", padx=16, pady=(12, 0))
+            count = ctk.CTkLabel(card, text="0", text_color=style["fg"], font=ctk.CTkFont(size=26, weight="bold"), anchor="w")
+            count.pack(fill="x", padx=16, pady=(0, 12))
             self.card_name.append(name)
             self.card_count.append(count)
 
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(fill="x", padx=16, pady=(8, 0))
-        self.view_btn = ctk.CTkSegmentedButton(bar, values=[VIEW_ITEMS, VIEW_FOLDERS], command=self._switch_view)
+        bar = ctk.CTkFrame(page, fg_color="transparent")
+        bar.pack(fill="x", padx=28, pady=(12, 0))
+        self.view_btn = ctk.CTkSegmentedButton(bar, values=[VIEW_ITEMS, VIEW_FOLDERS], command=self._switch_view, height=32)
         self.view_btn.pack(side="left")
         self.view_btn.set(VIEW_ITEMS)
-        self.view_hint = ctk.CTkLabel(bar, text="", text_color=("gray35", "gray70"), anchor="w")
+        self.view_hint = ctk.CTkLabel(bar, text="", text_color=MUTED, anchor="w")
         self.view_hint.pack(side="left", padx=12)
 
-        self.mid = ctk.CTkFrame(self, fg_color="transparent")
-        self.mid.pack(fill="both", expand=True, padx=16, pady=8)
+        self.mid = self._card(page)
+        self.mid.pack(fill="both", expand=True, padx=28, pady=10)
 
         self.items_frame = ctk.CTkFrame(self.mid, fg_color="transparent")
         self.tree = ttk.Treeview(self.items_frame, columns=("file", "dest"), show="headings", selectmode="browse")
         self.tree.heading("file", text="File", anchor="w")
         self.tree.heading("dest", text="Goes to", anchor="w")
-        self.tree.column("file", width=560)
-        self.tree.column("dest", width=240)
+        self.tree.column("file", width=520)
+        self.tree.column("dest", width=220)
         self.tree.tag_configure("skipped", foreground="#888888")
         self.tree.bind("<Double-1>", self._on_item_double)
         self.tree.bind("<Button-3>", self._on_item_menu)
@@ -993,39 +1185,271 @@ class App(ctk.CTk):
         for c in range(FOLDER_COLS):
             self.folders_frame.grid_columnconfigure(c, weight=1, uniform="tile")
 
-        self.items_frame.pack(fill="both", expand=True)
+        self.items_frame.pack(fill="both", expand=True, padx=10, pady=10)
         self._update_view_hint(VIEW_ITEMS)
 
-        bottom = ctk.CTkFrame(self, fg_color="transparent")
-        bottom.pack(fill="x", padx=16, pady=(0, 16))
+        bottom = ctk.CTkFrame(page, fg_color="transparent")
+        bottom.pack(fill="x", padx=28, pady=(0, 20))
         self.progress = ctk.CTkProgressBar(bottom, height=8)
         self.progress.set(0)
-        self.progress.pack(fill="x", pady=(0, 6))
+        self.progress.pack(fill="x", pady=(0, 8))
         row = ctk.CTkFrame(bottom, fg_color="transparent")
         row.pack(fill="x")
-        self.status = ctk.CTkLabel(row, text="", anchor="w", text_color=("gray35", "gray70"))
+        self.status = ctk.CTkLabel(row, text="", anchor="w", text_color=MUTED)
         self.status.pack(side="left", fill="x", expand=True)
-        self.bg_label = ctk.CTkLabel(row, text="", text_color=("gray35", "gray70"))
+        self.bg_label = ctk.CTkLabel(row, text="", text_color=MUTED)
         self.bg_label.pack(side="left", padx=8)
-        ctk.CTkCheckBox(row, text="Include subfolders", variable=self.var_sub,
-                        command=self._on_sub_toggle).pack(side="left", padx=8)
-        ctk.CTkButton(row, text="Undo", width=80, height=36, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=self.undo).pack(side="left", padx=4)
-        ctk.CTkButton(row, text="Organize now", width=130, height=36, command=self.organize).pack(side="left", padx=(4, 0))
+        ctk.CTkSwitch(row, text="Include subfolders", variable=self.var_sub, command=self._on_sub_toggle).pack(side="left", padx=10)
+        ctk.CTkButton(row, text="Undo", width=84, height=38, fg_color="transparent", border_width=1,
+                      text_color=TEXT, hover_color=CARD_ALT, command=self.undo).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="Organize now", width=140, height=38, font=ctk.CTkFont(weight="bold"),
+                      command=self.organize).pack(side="left", padx=(4, 0))
+
+    # ---- Auto-manage page
+    def _build_auto_page(self, page):
+        head = self._page_header(page, "Auto-manage", "Folders that Fildr keeps tidy in the background.")
+        ctk.CTkButton(head, text="+  Add folder", height=40, width=130, command=self.add_watch_folder).pack(side="right")
+
+        card = self._card(page)
+        card.pack(fill="x", padx=28, pady=(0, 10))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=14)
+        txt = ctk.CTkFrame(row, fg_color="transparent")
+        txt.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(txt, text="Run in the background", font=ctk.CTkFont(size=15, weight="bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(txt, text="Only files directly inside each folder are moved. Files still downloading are skipped.",
+                     text_color=MUTED, anchor="w").pack(anchor="w")
+        ctk.CTkSwitch(row, text="", width=46, variable=self.var_bg, command=self._on_bg_toggle).pack(side="right")
+
+        self.watch_list = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        self.watch_list.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
+    def reload_watch_page(self):
+        for w in self.watch_list.winfo_children():
+            w.destroy()
+        folders = self.cfg["watch_folders"]
+        if not folders:
+            empty = self._card(self.watch_list)
+            empty.pack(fill="x", padx=8, pady=6)
+            ctk.CTkLabel(empty, text="No folders yet.\nClick Add folder and pick one, like Downloads.",
+                         text_color=MUTED, justify="center").pack(pady=40)
+        for i, w in enumerate(folders):
+            path = w.get("path", "")
+            if not os.path.isdir(path):
+                status = "Missing"
+            elif w.get("enabled", True):
+                status = "Watching"
+            else:
+                status = "Paused"
+            row = self._card(self.watch_list)
+            row.pack(fill="x", padx=8, pady=6)
+            row.grid_columnconfigure(1, weight=1)
+            glyph = make_folder_glyph(MINT, 96)
+            ctk.CTkLabel(row, text="", image=self._img(glyph, 46)).grid(row=0, column=0, rowspan=2, padx=(18, 14), pady=16)
+            ctk.CTkLabel(row, text=short_text(os.path.basename(path.rstrip("\\/")) or path, 28),
+                         font=ctk.CTkFont(size=16, weight="bold"), anchor="w").grid(row=0, column=1, sticky="sw", pady=(16, 0))
+            ctk.CTkLabel(row, text=short_path(path, 62), text_color=MUTED, anchor="w",
+                         font=ctk.CTkFont(size=12)).grid(row=1, column=1, sticky="nw", pady=(0, 16))
+            ctk.CTkLabel(row, text="Status: " + status, anchor="e",
+                         text_color=MUTED if status != "Watching" else ("#0A6B4B", "#8EE8C4")).grid(
+                row=0, column=2, rowspan=2, padx=10)
+            sw = ctk.CTkSwitch(row, text="", width=46)
+            if w.get("enabled", True):
+                sw.select()
+            sw.configure(command=lambda i=i, sw=sw: self._toggle_watch(i, sw))
+            sw.grid(row=0, column=3, rowspan=2, padx=6)
+            ctk.CTkButton(row, text="\u2715", width=34, height=34, fg_color="transparent", hover_color=CARD_ALT,
+                          text_color=MUTED, command=lambda i=i: self._remove_watch(i)).grid(
+                row=0, column=4, rowspan=2, padx=(0, 14))
+        self._update_bg_label()
+
+    def _toggle_watch(self, i, sw):
+        if 0 <= i < len(self.cfg["watch_folders"]):
+            self.cfg["watch_folders"][i]["enabled"] = bool(sw.get())
+            save_config(self.cfg)
+        self.after(60, self.reload_watch_page)
+
+    def _remove_watch(self, i):
+        if 0 <= i < len(self.cfg["watch_folders"]):
+            if messagebox.askyesno("Auto-manage", "Stop managing this folder automatically?\n\n"
+                                   + self.cfg["watch_folders"][i].get("path", ""), parent=self):
+                del self.cfg["watch_folders"][i]
+                save_config(self.cfg)
+                self.after(60, self.reload_watch_page)
+
+    def add_watch_folder(self):
+        path = filedialog.askdirectory(parent=self, title="Choose a folder to manage automatically")
+        if not path:
+            return
+        path = os.path.normpath(path)
+        reason = unsafe_watch_folder(path)
+        if reason:
+            messagebox.showwarning("Auto-manage", f"That is {reason}. Choose a normal folder such as Downloads.", parent=self)
+            return
+        if any(os.path.normcase(w["path"]) == os.path.normcase(path) for w in self.cfg["watch_folders"]):
+            messagebox.showinfo("Auto-manage", "That folder is already in the list.", parent=self)
+            return
+        if not messagebox.askyesno(
+                "Auto-manage",
+                f"Files already in this folder will be sorted right away, and new files will be sorted as "
+                f"they arrive:\n\n{path}\n\nContinue?", parent=self):
+            return
+        self.cfg["watch_folders"].append({"path": path, "enabled": True})
+        register_existing_categories(self.cfg, path)
+        save_config(self.cfg)
+        self.reload_watch_page()
+
+    def open_watch(self):
+        self.show_page("auto")
+
+    # ---- Tools page
+    def _action_card(self, parent, title, desc, kind, color, soft, command):
+        card = self._card(parent)
+        card.pack(fill="x", padx=28, pady=7)
+        ico = self._img(tile_icon(kind, color, soft), 56)
+        pic = ctk.CTkLabel(card, text="", image=ico)
+        pic.pack(side="left", padx=(20, 16), pady=18)
+        txt = ctk.CTkFrame(card, fg_color="transparent")
+        txt.pack(side="left", fill="x", expand=True)
+        t = ctk.CTkLabel(txt, text=title, font=ctk.CTkFont(size=17, weight="bold"), anchor="w")
+        t.pack(anchor="w")
+        d = ctk.CTkLabel(txt, text=desc, text_color=MUTED, anchor="w")
+        d.pack(anchor="w")
+        arrow = ctk.CTkLabel(card, text="\u203a", font=ctk.CTkFont(size=28), text_color=MINT)
+        arrow.pack(side="right", padx=24)
+        for w in (card, pic, txt, t, d, arrow):
+            w.bind("<Button-1>", lambda e: command())
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+
+    def _build_tools_page(self, page):
+        self._page_header(page, "Tools", "Clean up beyond sorting.")
+        self._action_card(page, "Duplicate finder", "Find files with identical content and remove the extras.",
+                          "dupes", "#10B981", "#DDF5EA", self.open_duplicates)
+        self._action_card(page, "Large files", "See your biggest files and free up space.",
+                          "large", "#FF6B57", "#FFE8E3", self.open_large_files)
+        self._action_card(page, "Activity log", "Review everything Fildr moved, and restore files.",
+                          "log", "#E8A100", "#FFF3D6", self.open_log)
+
+    # ---- Settings page
+    def _section(self, parent, title):
+        ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(size=13, weight="bold"), text_color=MUTED,
+                     anchor="w").pack(fill="x", padx=10, pady=(14, 4))
+        card = self._card(parent)
+        card.pack(fill="x", padx=6, pady=(0, 4))
+        return card
+
+    def _setting(self, card, title, desc=""):
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=10)
+        txt = ctk.CTkFrame(row, fg_color="transparent")
+        txt.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(txt, text=title, font=ctk.CTkFont(size=14, weight="bold"), anchor="w").pack(anchor="w")
+        if desc:
+            ctk.CTkLabel(txt, text=desc, text_color=MUTED, anchor="w", justify="left", wraplength=470).pack(anchor="w")
+        ctrl = ctk.CTkFrame(row, fg_color="transparent")
+        ctrl.pack(side="right", padx=(12, 0))
+        return ctrl
+
+    def _segmented(self, parent, mapping, var, command):
+        seg = ctk.CTkSegmentedButton(parent, values=list(mapping), height=32,
+                                     command=lambda lab: (var.set(mapping[lab]), command()))
+        seg.set(next((lab for lab, val in mapping.items() if val == var.get()), list(mapping)[0]))
+        seg.pack()
+        return seg
+
+    def _build_settings_page(self, page):
+        self._page_header(page, "Settings", "Make Fildr work the way you like.")
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
+        c = self._section(scroll, "ORGANIZING")
+        ctrl = self._setting(c, "Include subfolders", "Pull files out of subfolders and sort them too (manual organizing only).")
+        ctk.CTkSwitch(ctrl, text="", width=46, variable=self.var_sub, command=self._on_sub_toggle).pack()
+        ctrl = self._setting(c, "Sort by date", "Group files inside each category by year, or by year and month.")
+        self._segmented(ctrl, {"Off": "off", "Year": "year", "Month": "month"}, self.var_date, self._on_option_change)
+        ctrl = self._setting(c, "Rename files", "Add a date prefix (2026-11-01_name) or a number prefix (001_name).")
+        self._segmented(ctrl, {"Keep": "off", "Date": "date", "Number": "number"}, self.var_rename, self._on_option_change)
+
+        c = self._section(scroll, "CUSTOMIZE")
+        for title, desc, cmd in (
+                ("Custom categories", "Add, edit or remove categories and their file types.", self.open_categories),
+                ("Ignore list", "Skip files that match a pattern, like *.tmp.", self.open_ignore),
+                ("Exclusions", "Files and folders that are never moved.", self.open_exclusions),
+                ("Folder icons", "Pick icons for your category folders.", self.open_icons)):
+            ctrl = self._setting(c, title, desc)
+            ctk.CTkButton(ctrl, text="Open", width=84, height=32, fg_color="transparent", border_width=1,
+                          text_color=TEXT, hover_color=CARD_ALT, command=cmd).pack()
+
+        c = self._section(scroll, "BACKGROUND")
+        ctrl = self._setting(c, "Start with Windows", "Run Fildr when you sign in to your PC.")
+        ctk.CTkSwitch(ctrl, text="", width=46, variable=self.var_startup, command=self._on_startup_toggle).pack()
+        ctrl = self._setting(c, "Keep running in the tray", "When the window is closed, keep sorting from the system tray.")
+        ctk.CTkSwitch(ctrl, text="", width=46, variable=self.var_tray, command=self._on_tray_toggle).pack()
+        ctrl = self._setting(c, "Pop-up notifications", "A small box in the bottom-right corner tells you what moved.")
+        ctk.CTkSwitch(ctrl, text="", width=46, variable=self.var_notify, command=self._on_notify_toggle).pack()
+        ctrl = self._setting(c, "Test notification", "See what a pop-up looks like.")
+        ctk.CTkButton(ctrl, text="Send test", width=84, height=32, fg_color="transparent", border_width=1,
+                      text_color=TEXT, hover_color=CARD_ALT, command=self.test_notification).pack()
+
+        c = self._section(scroll, "APPEARANCE")
+        ctrl = self._setting(c, "Theme", "Follow your system, or always use light or dark.")
+        self._segmented(ctrl, {"System": "System", "Light": "Light", "Dark": "Dark"}, self.var_theme, self._on_theme)
+
+    # ---- Help page
+    def _build_help_page(self, page):
+        self._page_header(page, "Help", "A quick tour of Fildr.")
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
+        card = self._card(scroll)
+        card.pack(fill="x", padx=8, pady=6)
+        steps = [
+            ("Choose a folder", "On Organize, click Browse. 'Items in folder' shows where each file will go. Nothing moves until you press Organize now."),
+            ("Organize", "After organizing, 'Organized folders' shows your folders. Double-click one to open it, right-click to change its icon."),
+            ("Let it run by itself", "On Auto-manage, add folders like Downloads. They are sorted in the background, even when the window is closed."),
+            ("Get a heads-up", "A small pop-up in the bottom-right corner tells you what moved, with a link that opens the folder."),
+            ("Changed your mind?", "Undo puts the last batch back. Tools > Activity log can restore older moves."),
+        ]
+        for i, (t, d) in enumerate(steps, 1):
+            row = ctk.CTkFrame(card, fg_color="transparent")
+            row.pack(fill="x", padx=18, pady=10)
+            badge = ctk.CTkFrame(row, width=34, height=34, corner_radius=17, fg_color=MINT, border_width=0)
+            badge.pack(side="left", anchor="n", padx=(0, 14))
+            badge.pack_propagate(False)
+            ctk.CTkLabel(badge, text=str(i), text_color=ON_MINT, font=ctk.CTkFont(weight="bold")).pack(expand=True)
+            col = ctk.CTkFrame(row, fg_color="transparent")
+            col.pack(side="left", fill="x", expand=True)
+            ctk.CTkLabel(col, text=t, font=ctk.CTkFont(size=14, weight="bold"), anchor="w").pack(anchor="w")
+            ctk.CTkLabel(col, text=d, text_color=MUTED, anchor="w", justify="left", wraplength=560).pack(anchor="w")
+
+        about = self._card(scroll)
+        about.pack(fill="x", padx=8, pady=6)
+        ctk.CTkLabel(about, text="", image=self._img(logo_pil(128), 64)).pack(side="left", padx=(20, 14), pady=18)
+        col = ctk.CTkFrame(about, fg_color="transparent")
+        col.pack(side="left")
+        ctk.CTkLabel(col, text="Fildr", font=ctk.CTkFont(size=18, weight="bold"), anchor="w").pack(anchor="w")
+        ctk.CTkLabel(col, text=TAGLINE, text_color=MUTED, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(col, text="Built with Python and customtkinter.", text_color=MUTED, anchor="w").pack(anchor="w")
+        ctk.CTkButton(about, text="Open icons folder", height=34, fg_color="transparent", border_width=1,
+                      text_color=TEXT, hover_color=CARD_ALT, command=open_icons_folder).pack(side="right", padx=20)
 
     def apply_tree_style(self):
         dark = ctk.get_appearance_mode() == "Dark"
-        bg = "#2b2b2b" if dark else "#ffffff"
-        fg = "#e6e6e6" if dark else "#1a1a1a"
-        head = "#3a3a3a" if dark else "#eeeeee"
+        bg = "#16251F" if dark else "#FFFFFF"
+        fg = "#E8F5EF" if dark else "#10231C"
+        head = "#1B2E27" if dark else "#EAF6F0"
         st = ttk.Style()
         st.theme_use("clam")
-        st.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=28,
+        st.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=32,
                      borderwidth=0, font=("Segoe UI", 10))
         st.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
         st.configure("Treeview.Heading", background=head, foreground=fg, relief="flat",
-                     font=("Segoe UI", 10, "bold"))
+                     font=("Segoe UI", 10, "bold"), padding=(6, 6))
         st.map("Treeview.Heading", background=[("active", head)])
+        st.configure("Vertical.TScrollbar", background=head, troughcolor=bg, bordercolor=bg, arrowcolor=fg, relief="flat")
 
     # ------------------------------------------------------------ views
     def _update_view_hint(self, value):
@@ -1099,13 +1523,13 @@ class App(ctk.CTk):
         if path and os.path.isdir(path):
             open_in_explorer(path)
         else:
-            messagebox.showwarning("File Organizer", "That folder isn't there any more.")
+            messagebox.showwarning("Fildr", "That folder isn't there any more.")
 
     # ------------------------------------------------------------ basic actions
     def _folder_ok(self, warn=False):
         ok = bool(self.folder) and os.path.isdir(self.folder)
         if not ok and warn:
-            messagebox.showwarning("File Organizer", "Select a folder first (File > Select folder).")
+            messagebox.showwarning("Fildr", "Select a folder first (File > Select folder).")
         return ok
 
     def select_folder(self):
@@ -1220,7 +1644,7 @@ class App(ctk.CTk):
             if register_category_folders(self.cfg, self.folder, names):
                 save_config(self.cfg)
         if not names:
-            hint = ctk.CTkLabel(self.folders_frame, text_color=("gray35", "gray70"),
+            hint = ctk.CTkLabel(self.folders_frame, text_color=MUTED,
                                 text="No organized folders yet.\nPress Organize now and they will show up here.")
             hint.grid(row=0, column=0, columnspan=FOLDER_COLS, pady=40)
             self.tile_widgets.append(hint)
@@ -1232,7 +1656,7 @@ class App(ctk.CTk):
         path = os.path.join(self.folder, name)
         count = count_files(path)
         new = self.recent.get(name, 0)
-        tile = ctk.CTkFrame(self.folders_frame, corner_radius=10, border_width=2 if new else 1,
+        tile = ctk.CTkFrame(self.folders_frame, corner_radius=16, fg_color=CARD_ALT, border_width=2 if new else 1,
                             border_color=ACCENT if new else NEUTRAL_BORDER)
         tile.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
         pic = ctk.CTkLabel(tile, text="", image=self.folder_image(name, path))
@@ -1241,7 +1665,7 @@ class App(ctk.CTk):
         title.pack()
         info = f"{count} item(s)" + (f"   +{new} new" if new else "")
         sub = ctk.CTkLabel(tile, text=info, font=ctk.CTkFont(size=11),
-                           text_color=(ACCENT, "#6cb0ff") if new else ("gray35", "gray70"))
+                           text_color=(ACCENT, "#34D399") if new else MUTED)
         sub.pack(pady=(0, 12))
         for w in (tile, pic, title, sub):
             w.bind("<Double-Button-1>", lambda e, p=path: self.open_path(p))
@@ -1342,7 +1766,7 @@ class App(ctk.CTk):
         var = tk.StringVar(value="single")
         body = ctk.CTkFrame(win, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=16)
-        muted = ("gray35", "gray70")
+        muted = MUTED
         list_holder = ctk.CTkFrame(body, fg_color="transparent")
         sel_all_var = tk.BooleanVar(value=False)
         state = {"rows": [], "checks": []}
@@ -1397,7 +1821,7 @@ class App(ctk.CTk):
             find_note.configure(text=f"Found {len(found)} in that location, {added} new.")
 
         ctk.CTkButton(find_row, text="Find more folders...", width=160, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=find_more).pack(side="left")
+                      text_color=TEXT, command=find_more).pack(side="left")
         find_note.pack(side="left", padx=10)
 
         parts = [(sel_all, dict(anchor="w", padx=(26, 0), pady=(4, 2))),
@@ -1453,7 +1877,7 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=16, pady=(8, 14))
         ctk.CTkButton(row, text="Reset icon" if resetting else "Apply", width=110, command=do_apply).pack(side="right")
         ctk.CTkButton(row, text="Cancel", width=80, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=win.destroy).pack(side="right", padx=8)
+                      text_color=TEXT, command=win.destroy).pack(side="right", padx=8)
 
     def pick_library_icon(self, on_pick, title="Choose an icon"):
         """Pick one of the .ico files in the project's icons folder. on_pick(path, name)."""
@@ -1466,7 +1890,7 @@ class App(ctk.CTk):
             ctk.CTkButton(win, text="Open icons folder", command=open_icons_folder).pack(pady=6)
             return
         ctk.CTkLabel(win, text="Pick an icon from your icons folder. Double-click to use it right away.",
-                     text_color=("gray35", "gray70")).pack(anchor="w", padx=16, pady=(14, 4))
+                     text_color=MUTED).pack(anchor="w", padx=16, pady=(14, 4))
         scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=10, pady=4)
         cols = 5
@@ -1509,10 +1933,10 @@ class App(ctk.CTk):
         row = ctk.CTkFrame(win, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(6, 14))
         ctk.CTkButton(row, text="Open icons folder", width=140, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=open_icons_folder).pack(side="left")
+                      text_color=TEXT, command=open_icons_folder).pack(side="left")
         ctk.CTkButton(row, text="Use this icon", width=120, command=use).pack(side="right")
         ctk.CTkButton(row, text="Cancel", width=80, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=win.destroy).pack(side="right", padx=8)
+                      text_color=TEXT, command=win.destroy).pack(side="right", padx=8)
 
     # ------------------------------------------------------------ option handlers
     def _on_sub_toggle(self):
@@ -1572,6 +1996,10 @@ class App(ctk.CTk):
         else:
             text = f"Background: watching {n} folder{'s' if n != 1 else ''}"
         self.bg_label.configure(text=text)
+        try:
+            self.side_bg.configure(text="\u25cf  " + text.replace("Background: ", "Background\n"))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ organize / undo (manual)
     def organize(self):
@@ -1579,15 +2007,15 @@ class App(ctk.CTk):
             return
         self.refresh(status=False)
         if not self.plan:
-            messagebox.showinfo("File Organizer", "No files to organize.")
+            messagebox.showinfo("Fildr", "No files to organize.")
             return
-        if not messagebox.askyesno("File Organizer", f"Move {len(self.plan)} file(s) into category folders?"):
+        if not messagebox.askyesno("Fildr", f"Move {len(self.plan)} file(s) into category folders?"):
             return
         self._run_plan(self.plan)
 
     def _run_plan(self, plan):
         if not self.work_lock.acquire(blocking=False):
-            messagebox.showinfo("File Organizer", "The background organizer is busy. Try again in a few seconds.")
+            messagebox.showinfo("Fildr", "The background organizer is busy. Try again in a few seconds.")
             return
         self.busy = True
         self.progress.set(0)
@@ -1616,7 +2044,7 @@ class App(ctk.CTk):
 
     def undo(self):
         if not self.last_moves:
-            messagebox.showinfo("File Organizer", "Nothing to undo.")
+            messagebox.showinfo("Fildr", "Nothing to undo.")
             return
         restored, entries, back = 0, [], []
         for new, old, _cat in reversed(self.last_moves):
@@ -1721,15 +2149,15 @@ class App(ctk.CTk):
         if not HAS_TRAY:
             return
         try:
-            image = make_folder_glyph("#378ADD")
+            image = logo_pil(64)
             menu = pystray.Menu(
-                pystray.MenuItem("Open File Organizer", lambda icon, item: self.ui_queue.put(("show",)), default=True),
+                pystray.MenuItem("Open Fildr", lambda icon, item: self.ui_queue.put(("show",)), default=True),
                 pystray.MenuItem("Auto-organize in background", lambda icon, item: self.ui_queue.put(("toggle_bg",)),
                                  checked=lambda item: self.cfg["bg_enabled"]),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Exit", lambda icon, item: self.ui_queue.put(("quit",))),
             )
-            self.tray = pystray.Icon(APP_NAME, image, "File Organizer", menu)
+            self.tray = pystray.Icon(APP_NAME, image, "Fildr", menu)
             self.tray.run_detached()
         except Exception:
             self.tray = None
@@ -1746,7 +2174,7 @@ class App(ctk.CTk):
             self.withdraw()
             if not self._tray_hint_shown:
                 self._tray_hint_shown = True
-                self.show_toast({"title": "File Organizer", "folder": "", "select": [],
+                self.show_toast({"title": "Fildr", "folder": "", "select": [],
                                  "text": "Still running in the tray. Right-click the tray icon to exit."})
             return
         self._quit()
@@ -1886,6 +2314,7 @@ class App(ctk.CTk):
         win.geometry(f"{w}x{h}")
         win.transient(self)
         win.after(150, win.lift)
+        self._set_window_icon(win)
         return win
 
     def _make_tree(self, parent, columns, widths, selectmode="extended", show="headings"):
@@ -1920,89 +2349,12 @@ class App(ctk.CTk):
 
         self.after(150, poll)
 
-    # ------------------------------------------------------------ auto-manage folders
-    def open_watch(self):
-        win = self._toplevel("Auto-manage folders", 700, 500)
-        ctk.CTkLabel(win, justify="left", wraplength=650, text_color=("gray35", "gray70"),
-                     text="These folders are sorted automatically in the background, even when the window is "
-                          "closed. Only files directly inside each folder are moved, and files that are still "
-                          "downloading are skipped. They use the same categories and options as the rest of the app."
-                     ).pack(anchor="w", padx=16, pady=(14, 6))
-        frame, tree = self._make_tree(win, [("path", "Folder"), ("status", "Status")], [520, 120], selectmode="browse")
-        frame.pack(fill="both", expand=True, padx=16, pady=6)
-
-        def reload():
-            tree.delete(*tree.get_children())
-            for i, w in enumerate(self.cfg["watch_folders"]):
-                if not os.path.isdir(w.get("path", "")):
-                    status = "Missing"
-                elif w.get("enabled", True):
-                    status = "Watching"
-                else:
-                    status = "Paused"
-                tree.insert("", "end", iid=str(i), values=(w.get("path", ""), status))
-            self._update_bg_label()
-
-        def commit():
-            save_config(self.cfg)
-            reload()
-
-        def add():
-            path = filedialog.askdirectory(parent=win, title="Choose a folder to manage automatically")
-            if not path:
-                return
-            path = os.path.normpath(path)
-            reason = unsafe_watch_folder(path)
-            if reason:
-                messagebox.showwarning("Auto-manage", f"That is {reason}. Choose a normal folder such as Downloads.", parent=win)
-                return
-            if any(os.path.normcase(w["path"]) == os.path.normcase(path) for w in self.cfg["watch_folders"]):
-                messagebox.showinfo("Auto-manage", "That folder is already in the list.", parent=win)
-                return
-            if not messagebox.askyesno(
-                    "Auto-manage",
-                    f"Files already in this folder will be sorted right away, and new files will be sorted as "
-                    f"they arrive:\n\n{path}\n\nContinue?", parent=win):
-                return
-            self.cfg["watch_folders"].append({"path": path, "enabled": True})
-            register_existing_categories(self.cfg, path)
-            commit()
-
-        def selected_index():
-            sel = tree.selection()
-            return int(sel[0]) if sel else None
-
-        def remove():
-            i = selected_index()
-            if i is not None:
-                del self.cfg["watch_folders"][i]
-                commit()
-
-        def toggle():
-            i = selected_index()
-            if i is not None:
-                w = self.cfg["watch_folders"][i]
-                w["enabled"] = not w.get("enabled", True)
-                commit()
-                tree.selection_set(str(i))
-
-        row = ctk.CTkFrame(win, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=(6, 14))
-        ctk.CTkButton(row, text="Add folder...", width=110, command=add).pack(side="left")
-        ctk.CTkButton(row, text="Pause or resume", width=130, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=toggle).pack(side="left", padx=8)
-        ctk.CTkButton(row, text="Remove", width=90, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=remove).pack(side="left")
-        ctk.CTkSwitch(row, text="Run in background", variable=self.var_bg,
-                      command=lambda: (self._on_bg_toggle(), reload())).pack(side="right")
-        reload()
-
     # ------------------------------------------------------------ custom categories
     def open_categories(self):
         win = self._toplevel("Custom categories", 640, 460)
         ctk.CTkLabel(win, text="Files go to the first category that lists their extension. "
                                "Anything unlisted goes to Others.",
-                     wraplength=590, justify="left", text_color=("gray35", "gray70")).pack(anchor="w", padx=16, pady=(14, 6))
+                     wraplength=590, justify="left", text_color=MUTED).pack(anchor="w", padx=16, pady=(14, 6))
         frame, tree = self._make_tree(win, [("name", "Folder"), ("exts", "Extensions")], [150, 440], selectmode="browse")
         frame.pack(fill="both", expand=True, padx=16, pady=6)
 
@@ -2088,7 +2440,7 @@ class App(ctk.CTk):
         ctk.CTkButton(row, text="Edit", width=80, command=on_edit).pack(side="left", padx=6)
         ctk.CTkButton(row, text="Remove", width=80, command=on_remove).pack(side="left")
         ctk.CTkButton(row, text="Reset to defaults", width=130, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=on_reset).pack(side="right")
+                      text_color=TEXT, command=on_reset).pack(side="right")
         reload()
 
     # ------------------------------------------------------------ exclusions
@@ -2098,7 +2450,7 @@ class App(ctk.CTk):
 
     def open_exclusions(self):
         win = self._toplevel("Exclusions", 740, 540)
-        ctk.CTkLabel(win, justify="left", wraplength=690, text_color=("gray35", "gray70"),
+        ctk.CTkLabel(win, justify="left", wraplength=690, text_color=MUTED,
                      text="Excluded files and folders are never moved, by Organize now or by the background "
                           "organizer. Excluding a folder excludes everything inside it."
                      ).pack(anchor="w", padx=16, pady=(14, 6))
@@ -2152,11 +2504,11 @@ class App(ctk.CTk):
         ctk.CTkButton(row, text="Add files...", width=100, command=add_files).pack(side="left")
         ctk.CTkButton(row, text="Add folder...", width=110, command=add_folder).pack(side="left", padx=6)
         ctk.CTkButton(row, text="Remove selected", width=130, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=remove).pack(side="left")
+                      text_color=TEXT, command=remove).pack(side="left")
         ctk.CTkButton(row, text="Clear all", width=90, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=clear_all).pack(side="right")
+                      text_color=TEXT, command=clear_all).pack(side="right")
         ctk.CTkButton(row, text="Remove missing", width=120, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=remove_missing).pack(side="right", padx=6)
+                      text_color=TEXT, command=remove_missing).pack(side="right", padx=6)
         reload()
 
     # ------------------------------------------------------------ ignore list
@@ -2164,7 +2516,7 @@ class App(ctk.CTk):
         win = self._toplevel("Ignore list", 440, 400)
         ctk.CTkLabel(win, text="One pattern per line. Matching files are never moved.\n"
                                "Examples: *.tmp   ~*   notes.txt",
-                     justify="left", text_color=("gray35", "gray70")).pack(anchor="w", padx=16, pady=(14, 6))
+                     justify="left", text_color=MUTED).pack(anchor="w", padx=16, pady=(14, 6))
         box = ctk.CTkTextbox(win, height=220)
         box.pack(fill="both", expand=True, padx=16, pady=6)
         box.insert("1.0", "\n".join(self.cfg["ignore"]))
@@ -2185,7 +2537,7 @@ class App(ctk.CTk):
         if not self._folder_ok(warn=True):
             return
         win = self._toplevel("Folder icons", 660, 560)
-        ctk.CTkLabel(win, justify="left", wraplength=610, text_color=("gray35", "gray70"),
+        ctk.CTkLabel(win, justify="left", wraplength=610, text_color=MUTED,
                      text=f"Icons for the folders inside {short_path(self.folder, 50)}. These only change this "
                           "folder's own folders. To change several folders, or every folder with the same name, "
                           "right-click a folder under 'Organized folders'.").pack(anchor="w", padx=16, pady=(14, 4))
@@ -2215,11 +2567,11 @@ class App(ctk.CTk):
             row = ctk.CTkFrame(scroll, fg_color="transparent")
             row.pack(fill="x", pady=4)
             ctk.CTkLabel(row, text=short_text(title, 30), width=210, anchor="w").pack(side="left")
-            labels[p] = ctk.CTkLabel(row, text=text_for(p), anchor="w", width=140, text_color=("gray35", "gray70"))
+            labels[p] = ctk.CTkLabel(row, text=text_for(p), anchor="w", width=140, text_color=MUTED)
             labels[p].pack(side="left", padx=6)
             ctk.CTkButton(row, text="Choose...", width=84, height=30, command=lambda k=p: choose(k)).pack(side="left")
             ctk.CTkButton(row, text="Clear", width=60, height=30, fg_color="transparent", border_width=1,
-                          text_color=("gray10", "gray90"), command=lambda k=p: clear(k)).pack(side="left", padx=6)
+                          text_color=TEXT, command=lambda k=p: clear(k)).pack(side="left", padx=6)
 
         def apply():
             errors = []
@@ -2247,10 +2599,10 @@ class App(ctk.CTk):
         row = ctk.CTkFrame(win, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(6, 14))
         ctk.CTkButton(row, text="Reset all", width=90, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=reset_all).pack(side="left")
+                      text_color=TEXT, command=reset_all).pack(side="left")
         ctk.CTkButton(row, text="Apply icons", width=120, command=apply).pack(side="right")
         ctk.CTkButton(row, text="Cancel", width=80, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=win.destroy).pack(side="right", padx=8)
+                      text_color=TEXT, command=win.destroy).pack(side="right", padx=8)
 
     # ------------------------------------------------------------ duplicates
     def open_duplicates(self):
@@ -2403,7 +2755,7 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=16, pady=(0, 14))
         ctk.CTkButton(row, text="Show in Explorer", width=140, command=show).pack(side="left")
         ctk.CTkButton(row, text="Rescan", width=90, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=scan).pack(side="left", padx=8)
+                      text_color=TEXT, command=scan).pack(side="left", padx=8)
         ctk.CTkButton(row, text="Delete selected", fg_color="#b3261e", hover_color="#8c1d18",
                       command=delete).pack(side="right")
         scan()
@@ -2412,7 +2764,7 @@ class App(ctk.CTk):
     def open_log(self):
         win = self._toplevel("Activity log", 900, 540)
         ctk.CTkLabel(win, text="Everything the app moved or deleted. Select moves and press Restore to put them back.",
-                     anchor="w", text_color=("gray35", "gray70")).pack(fill="x", padx=16, pady=(14, 4))
+                     anchor="w", text_color=MUTED).pack(fill="x", padx=16, pady=(14, 4))
         frame, tree = self._make_tree(win, [("time", "Time"), ("action", "Action"), ("src", "From"), ("dst", "To")],
                                       [140, 70, 330, 330])
         frame.pack(fill="both", expand=True, padx=16, pady=8)
@@ -2463,23 +2815,14 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=16, pady=(0, 14))
         ctk.CTkButton(row, text="Restore selected", width=140, command=restore).pack(side="left")
         ctk.CTkButton(row, text="Refresh", width=90, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=reload).pack(side="left", padx=8)
+                      text_color=TEXT, command=reload).pack(side="left", padx=8)
         ctk.CTkButton(row, text="Clear log", width=90, fg_color="transparent", border_width=1,
-                      text_color=("gray10", "gray90"), command=clear).pack(side="right")
+                      text_color=TEXT, command=clear).pack(side="right")
         reload()
 
     # ------------------------------------------------------------ help
     def show_help(self):
-        messagebox.showinfo(
-            "How it works",
-            "1. File > Select folder to choose a folder. The 'Items in folder' view shows where each file "
-            "will go. Nothing moves until you press Organize now.\n"
-            "2. After organizing, 'Organized folders' shows your folders. Double-click one to open it; "
-            "right-click to change its icon.\n"
-            "3. Background > Auto-manage folders lets you pick folders (like Downloads) that are sorted "
-            "automatically, even when the window is closed.\n"
-            "4. A small pop-up in the bottom-right corner tells you what moved, with a link that opens the folder.\n"
-            "5. Undo puts the last batch back. The Activity log can restore older moves.")
+        self.show_page("help")
 
 
 if __name__ == "__main__":
@@ -2487,7 +2830,7 @@ if __name__ == "__main__":
         if not BACKGROUND_START:
             _r = tk.Tk()
             _r.withdraw()
-            messagebox.showinfo("File Organizer", "File Organizer is already running. "
+            messagebox.showinfo("Fildr", "Fildr is already running. "
                                                   "Look for its icon in the system tray, next to the clock.")
         sys.exit(0)
     App().mainloop()
